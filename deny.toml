@@ -1,0 +1,146 @@
+# cargo-deny policy for the passway workspace.
+#
+# Run with: cargo deny check
+#
+# passway is TRUST-BOUNDARY code (public-facing L7 listener + edge auth) —
+# this policy is deliberately narrower than a typical yah/oss crate's:
+# rustls only, ever (R594-S1 spike verdict: "rustls feature only — never
+# enable pingora's boringssl/openssl features in this crate"), and every
+# license is permissive (MIT / BSD / Apache-2.0 / ISC / Unicode / Zlib /
+# MPL-2.0). Anything copyleft (GPL / LGPL / AGPL / SSPL) is rejected
+# outright — those terms would re-license downstream consumers and conflict
+# with the dual-MIT/Apache-2.0 license of every crate in this workspace.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------------------
+# Licenses
+# ---------------------------------------------------------------------------
+[licenses]
+version = 2
+confidence-threshold = 0.93
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "OpenSSL",
+]
+exceptions = []
+
+# Crates with non-SPDX or ambiguous licensing get pinned here with the upstream
+# license file hash so a license-text drift trips the lint.
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+# ---------------------------------------------------------------------------
+# Bans
+# ---------------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = [
+    # OpenSSL / BoringSSL: passway is an all-rustls crate (R594-S1: "rustls
+    # feature only — never enable pingora's boringssl/openssl features").
+    # Pulling either means a C toolchain and a separate cert-path story,
+    # both out of scope, and — for boringssl specifically — a TLS backend
+    # the spike never hardening-reviewed.
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+    { name = "boring" },
+    { name = "boring-sys" },
+    # s2n-tls: same reasoning — a third TLS backend pingora supports that
+    # this crate deliberately never enables.
+    { name = "s2n-tls" },
+    { name = "s2n-tls-sys" },
+]
+skip = []
+skip-tree = []
+
+# NOTE on pingora-cache: it is NOT banned above even though this crate never
+# behaviorally enables caching. `pingora-cache` is a mandatory (non-optional)
+# dependency of `pingora-proxy` itself — `ProxyHttp`'s own trait signature
+# carries `CacheKey`/`CacheMeta`/`RespCacheable` types (confirmed via
+# `cargo tree -i pingora-cache`: pingora-cache <- pingora-proxy <- pingora),
+# so it is unavoidably present in the graph for anyone who implements
+# `ProxyHttp` at all, caching or not. A ban here would just fail every build.
+# R594-S1's smuggling-hardening posture instead keeps CVE-2025-4366's
+# vulnerable code path (a response-cache-HIT skipping the downstream body
+# drain) behaviorally unreachable: `proxy::PassProxy` never overrides
+# `request_cache_filter` (default no-op, cache stays disabled) or
+# `cache_key_callback` (default `unimplemented!()`), so `session.cache` is
+# never populated and a cache hit can never occur. If a future cache tier is
+# proposed, grep this crate for any `request_cache_filter`/`cache_key_callback`
+# override as the signal that the "cache stays off" invariant changed, and
+# re-audit against pingora's CVE-2025-4366 fix commit
+# (`fda3317ec822678564d641e7cf1c9b77ee3759ff`) at whatever pingora version is
+# current then.
+
+# ---------------------------------------------------------------------------
+# Advisories
+# ---------------------------------------------------------------------------
+[advisories]
+version = 2
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# All four below are transitive through pingora-core 0.8.1 itself (verified
+# via `cargo deny check` + `cargo tree -i <crate>`, 2026-07-02) — pingora is
+# pinned to the exact version the R594-S1 spike tested and 0.8.1 is also the
+# newest published release (checked crates.io's sparse index directly), so
+# there is no "just bump the version" fix available today. None sit on a
+# code path this crate actually exercises:
+ignore = [
+    # daemonize 0.5.0 — pingora-core's `--daemon` background-process mode.
+    # passway's ServerConf never sets `daemon: true` (Server::new(None)
+    # default), so this code never runs; the crate is merely compiled in.
+    "RUSTSEC-2025-0069",
+    # derivative 2.2.0 — a compile-time derive proc-macro used by
+    # pingora-core/pingora-load-balancing for Clone/Hash/Ord impls. No
+    # runtime attack surface at all (macro expansion happens at `cargo
+    # build` time, not in the running proxy).
+    "RUSTSEC-2024-0388",
+    # protobuf 2.28.0 (RUSTSEC-2024-0437, stack-overflow-on-untrusted-input)
+    # — pulled by the `prometheus` crate, an unconditional dependency of
+    # pingora-core for its OPTIONAL Prometheus metrics HTTP service
+    # (`pingora::services::listening::Service::prometheus_http_service`).
+    # `main.rs` never wires that service up, so this parser never sees a
+    # byte of untrusted input in this crate's deployment; still worth
+    # revisiting once pingora bumps `prometheus` past the vulnerable
+    # `protobuf` release.
+    "RUSTSEC-2024-0437",
+    # rustls-pemfile 2.2.0 — unmaintained (no CVE), used by pingora-rustls
+    # for `TlsSettings::intermediate`'s cert/key PEM loading, which IS on
+    # this crate's active path. Upstream's own advisory says migrating to
+    # `rustls-pki-types`'s `PemObject` trait is straightforward, but that
+    # migration is pingora's to make, not reachable from this crate's
+    # Cargo.toml. Re-check on every pingora bump.
+    "RUSTSEC-2025-0134",
+]
+
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

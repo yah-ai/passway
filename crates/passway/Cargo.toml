@@ -1,0 +1,46 @@
+[package]
+name = "passway"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sovereign public-ingress L7 proxy (R594-F4 / W267 Tier-1): pingora-based reverse proxy with rustls TLS termination, cheers-verify edge auth, and request-smuggling hardening."
+keywords = ["proxy", "ingress", "pingora", "tls", "edge"]
+categories = ["network-programming", "web-programming::http-server"]
+readme = "README.md"
+
+# TRUST-BOUNDARY crate: public-facing listener + edge auth path. Pin
+# `pingora >= 0.8.1` (R594-S1 spike verdict — request-smuggling fix
+# CVE-2025-4366 / RUSTSEC-2025-0037 landed in 0.5.0; 0.8.1 is the tested
+# version). `rustls` + `lb` features ONLY: rustls is the sole TLS backend
+# this crate ever links (never boringssl/openssl — see deny.toml's explicit
+# bans), and `lb` pulls in pingora-proxy + pingora-load-balancing so this one
+# dependency covers the whole L7-proxy-plus-round-robin surface.
+[dependencies]
+pingora = { version = ">=0.8.1", features = ["rustls", "lb"] }
+
+async-trait = "0.1"
+bytes = "1"
+http = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+
+# cheers-verify edge auth (R594-F4 V0 MUST #3): PasetoV4PublicVerifier +
+# McpClaims, path+version dep into the co-developed oss/cheers workspace —
+# the same shape `crates/yah/cloud-admin` (this platform's only other
+# in-tree consumer of cheers-verify outside the cheers workspace itself)
+# already uses. cheers-verify holds no minter (edge-safe by construction),
+# so a compromised passway process cannot forge a session.
+cheers-core = { path = "../../../cheers/crates/cheers-core", version = "0.8.18" }
+cheers-verify = { path = "../../../cheers/crates/cheers-verify", version = "0.8.18" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+# rustls-tls only, no native-tls — matches this crate's all-rustls posture
+# even in the test HTTP client.
+reqwest = { version = "0.12", features = ["rustls-tls", "http2", "json"], default-features = false }
+pasetors = "0.7"

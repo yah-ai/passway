@@ -1,0 +1,21 @@
+# passway is its own Cargo workspace (R594-F4, 2026-07-02) — the sovereign
+# public-ingress L7 proxy for W267's Tier-1 "rented doorknob" edge. Kept as
+# an independent workspace (not a yah root-workspace member, no
+# `workspace = true` inheritance from yah root — A0057) so it stays
+# buildable standalone once exported to github.com/yah-ai/passway — see
+# scripts/export-oss.sh and root Cargo.toml's `exclude = ["oss", "external"]`.
+#
+# `passway` is an operator-blessed bare crate/binary name (crates.io-free,
+# verified 2026-07-02) — do NOT add a `yah-` prefix, do NOT run
+# reserve-crate-names.sh or `cargo publish` here; that is the operator's
+# move, not this ticket's.
+[workspace]
+members = ["crates/passway"]
+resolver = "2"
+
+[workspace.package]
+version = "0.8.18"
+edition = "2021"
+authors = ["yah Dev <human@yah.dev>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yah-ai/passway"
