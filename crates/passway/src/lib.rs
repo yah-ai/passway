@@ -13,6 +13,11 @@
 //! - [`proxy`] — [`proxy::PassProxy`], the `pingora::proxy::ProxyHttp` impl
 //!   that is the actual request path (routing, auth gate, hardening,
 //!   `/health`).
+//! - [`acme`] — R594-F7: automated Let's Encrypt issuance + renewal for
+//!   [`tls::TlsMode::Acme`] (`instant-acme`, HTTP-01, writes to the same
+//!   cert/key paths `TlsMode::Manual` reads; the reload gap is closed via
+//!   pingora's graceful-upgrade, documented as a supervisor signal
+//!   contract rather than a self-triggered restart — see the module doc).
 //! - [`upstream`] — the pluggable [`upstream::UpstreamSource`] seam plus
 //!   the v0 [`upstream::StaticUpstreams`] implementation and the
 //!   `pingora::lb::LoadBalancer` builder.
@@ -21,6 +26,10 @@
 //! - [`hardening`] — the request-smuggling defenses (hop-by-hop header
 //!   stripping, Content-Length/Transfer-Encoding conflict rejection) as
 //!   pure, independently-testable functions over [`http::HeaderMap`].
+//! - [`path`] — request-path canonicalization for the auth decision
+//!   (percent-decode, dot-segment/duplicate-slash normalization, fail-closed
+//!   rejection of ambiguous or non-UTF-8 paths) so the auth gate decides on
+//!   the same form the upstream resolves.
 //! - [`health`] — the `/health` readiness computation, independent of any
 //!   pingora type.
 //! - [`tls`] — TLS listener configuration: v0's bring-your-own-cert path,
@@ -41,17 +50,20 @@
 //! R594-S1 spike verdict specified (pingora `rustls` + `lb` features only —
 //! see `deny.toml`'s explicit TLS-backend bans).
 //!
-//! The `@yah:ticket(R594-F4)` annotation is homed in
+//! The board ticket for this crate (R594-F4) is homed in
 //! `.yah/docs/working/W267-sovereign-public-ingress.md` (single source of
 //! truth — Rule11 dedup, 2026-07-03), alongside its sibling R594 tickets.
 
+pub mod acme;
 pub mod auth;
 pub mod hardening;
 pub mod health;
+pub mod path;
 pub mod proxy;
 pub mod tls;
 pub mod upstream;
 
+pub use acme::{AcmeConfig, AcmeDirectory, AcmeRenewalService};
 pub use auth::{CheersAuth, RouteAuthPolicy};
 pub use health::ReadinessBody;
 pub use proxy::PassProxy;

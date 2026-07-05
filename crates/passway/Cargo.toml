@@ -23,11 +23,40 @@ pingora = { version = ">=0.8.1", features = ["rustls", "lb"] }
 async-trait = "0.1"
 bytes = "1"
 http = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
+# RFC 3986 percent-decoding for the auth-path canonicalizer (path.rs). Already
+# in the graph transitively via pingora; taken as a direct dep so the
+# trust-boundary path-normalization logic doesn't hand-roll a decoder.
+percent-encoding = "2"
+# `io-util` (BufReader/AsyncBufReadExt/AsyncWriteExt): the R594-F7 ACME
+# HTTP-01 responder (acme.rs) hand-rolls its own tiny HTTP/1.1 GET handler
+# over raw tokio TCP streams rather than pulling in a full HTTP server dep
+# for a handful of well-known-path responses.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
 env_logger = "0.11"
+
+# R594-F7: automated Let's Encrypt (ACME/RFC-8555) issuance + renewal for
+# tls::TlsMode::Acme. Apache-2.0 (permissive — verified via `cargo info
+# instant-acme` and `cargo deny check`). `default-features = false` drops
+# the crate's own default `aws-lc-rs` crypto backend in favor of `ring`
+# (feature "ring") to match the provider `pingora-rustls` installs at
+# runtime (`pingora_rustls::install_default_crypto_provider()`), so this
+# dependency declaration doesn't add its own, separate reason to need
+# `aws-lc-rs` — note that doesn't make `aws-lc-rs` vanish from the build:
+# pingora-rustls 0.8.1's own manifest depends on `rustls` without disabling
+# default features, so `aws_lc_rs` (one of `rustls`'s own defaults) is
+# already compiled in via plain `pingora` regardless of this crate; see
+# acme.rs's module doc for how that was confirmed. `hyper-rustls` is
+# instant-acme's built-in HTTPS client (talks to the ACME directory over
+# rustls, never native-tls); `rcgen` lets `Order::finalize()` generate the
+# end-entity keypair + CSR so this crate never hand-rolls X.509. See
+# acme.rs's module doc for the full crate-choice + challenge-type
+# rationale (HTTP-01, not TLS-ALPN-01 — pingora's static rustls
+# `TlsSettings` can't serve a dynamic per-ALPN challenge cert on the same
+# port the production listener already owns).
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
 
 # cheers-verify edge auth (R594-F4 V0 MUST #3): PasetoV4PublicVerifier +
 # McpClaims, path+version dep into the co-developed oss/cheers workspace —

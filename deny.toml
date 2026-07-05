@@ -37,6 +37,18 @@ allow = [
     "MPL-2.0",
     "CC0-1.0",
     "OpenSSL",
+    # R594-F7 (instant-acme, ACME/Let's Encrypt automation): `webpki-roots`
+    # / `webpki-root-certs` — Mozilla's bundled CA root certificate DATA,
+    # repackaged as a Rust crate, pulled transitively via
+    # `rustls-platform-verifier` <- `hyper-rustls` <- `instant-acme`'s own
+    # Cargo.toml (its `hyper-rustls` feature spec hardcodes
+    # `rustls-platform-verifier`; not a choice made in this crate's
+    # Cargo.toml). CDLA-Permissive-2.0 is a genuinely permissive (no
+    # copyleft, no field-of-use restriction) data license in the same
+    # family as the already-allowed CC0-1.0 above — it licenses the
+    # bundled certificate *data*, not code redistribution terms, and
+    # imposes no obligation on this crate or its consumers.
+    "CDLA-Permissive-2.0",
 ]
 exceptions = []
 

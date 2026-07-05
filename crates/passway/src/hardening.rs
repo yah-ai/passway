@@ -30,7 +30,7 @@
 //! actually hands us) `Deref`s/`DerefMut`s to `http::request::Parts`, whose
 //! `headers` field is exactly this type.
 
-use http::header::{HeaderName, CONNECTION, CONTENT_LENGTH, TRANSFER_ENCODING};
+use http::header::{CONNECTION, CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::HeaderMap;
 
 /// RFC 7230 §6.1 hop-by-hop headers, plus the legacy `Keep-Alive` header
@@ -67,16 +67,24 @@ pub const HOP_BY_HOP: &[&str] = &[
 /// keeps the "client can't nominate these" set explicit and complete.
 const NEVER_NOMINATE_STRIP: &[&str] = &["content-length", "transfer-encoding", "host", "te"];
 
-/// Strip hop-by-hop headers from `headers` in place.
+/// Compute the (lowercased) set of header names to strip from a request
+/// before forwarding it upstream.
 ///
-/// Two passes: the fixed [`HOP_BY_HOP`] list, plus — per RFC 7230 §6.1 —
+/// Two sources: the fixed [`HOP_BY_HOP`] list, plus — per RFC 7230 §6.1 —
 /// any additional header name the request itself *nominates* via a
-/// comma-separated `Connection` header value (e.g. `Connection: X-Foo`
-/// means "also strip `X-Foo`, it was hop-by-hop for this specific
-/// request"). The nominated names are collected before any removal so the
-/// still-present `Connection` header can be read in full.
-pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
-    let mut nominated: Vec<String> = Vec::new();
+/// comma-separated `Connection` header value (e.g. `Connection: X-Foo` means
+/// "also strip `X-Foo`, it was hop-by-hop for this specific request"),
+/// except the framing/routing headers in [`NEVER_NOMINATE_STRIP`] which a
+/// client may not point that mechanism at (FIX 3).
+///
+/// This computes names only (a read-only pass) so the *removal* can be done
+/// through whichever header API keeps the target's invariants — critically,
+/// pingora's `RequestHeader::remove_header`, which maintains its
+/// case-preserving header map alongside the value map. Removing directly on
+/// the underlying [`HeaderMap`] would desync those two and trip pingora's
+/// HTTP/1 serializer.
+pub fn headers_to_strip(headers: &HeaderMap) -> Vec<String> {
+    let mut names: Vec<String> = HOP_BY_HOP.iter().map(|s| s.to_string()).collect();
     for v in headers.get_all(CONNECTION).iter() {
         if let Ok(s) = v.to_str() {
             for tok in s.split(',') {
@@ -86,22 +94,28 @@ pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
                 }
                 // FIX 3: a client cannot nominate a framing/routing header
                 // for stripping (it's stripped only if it's an actual
-                // hop-by-hop header on the fixed list).
+                // hop-by-hop header on the fixed list above).
                 if NEVER_NOMINATE_STRIP.contains(&tok.as_str()) {
                     continue;
                 }
-                nominated.push(tok);
+                if !names.contains(&tok) {
+                    names.push(tok);
+                }
             }
         }
     }
+    names
+}
 
-    for name in HOP_BY_HOP {
-        headers.remove(*name);
-    }
-    for name in nominated {
-        if let Ok(hn) = HeaderName::try_from(name.as_str()) {
-            headers.remove(hn);
-        }
+/// Strip hop-by-hop headers from a plain [`HeaderMap`] in place.
+///
+/// This is the direct-on-`HeaderMap` form, used for unit testing the strip
+/// semantics. The proxy's forwarding path does NOT call this — it drives
+/// [`headers_to_strip`] + pingora's `RequestHeader::remove_header` so the
+/// case-preserving map stays in sync (see [`headers_to_strip`]).
+pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
+    for name in headers_to_strip(headers) {
+        headers.remove(name.as_str());
     }
 }
 
@@ -121,6 +135,7 @@ pub fn has_conflicting_length_headers(headers: &HeaderMap) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::header::HeaderName;
     use http::HeaderValue;
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {

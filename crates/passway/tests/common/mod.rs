@@ -22,7 +22,7 @@ use std::time::Duration;
 use pingora::server::Server;
 use pingora::services::background::background_service;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 use passway::auth::{CheersAuth, RouteAuthPolicy};
 use passway::proxy::PassProxy;
@@ -33,6 +33,45 @@ use passway::upstream::{build_load_balancer, StaticUpstreams};
 pub fn free_addr() -> SocketAddr {
     let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("local_addr")
+}
+
+/// Send a fully-formed raw HTTP/1.1 request and return the response status
+/// code (0 if the peer closed without a parseable status line). This
+/// bypasses reqwest/hyper's client-side URL normalization — essential for
+/// the path-confusion vectors, which reqwest would collapse (`/public/../`
+/// etc.) before they ever hit the proxy. Bytes-in so a non-UTF-8 path can be
+/// sent verbatim.
+pub async fn send_raw(addr: SocketAddr, raw_request: &[u8]) -> u16 {
+    let mut stream = TcpStream::connect(addr).await.expect("connect to proxy");
+    stream.write_all(raw_request).await.expect("write request");
+    let mut buf = Vec::new();
+    // We send `Connection: close`, so read_to_end gets the whole response
+    // then EOF. Guard with a timeout so a hang fails the test loudly.
+    let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut buf)).await;
+    parse_status(&buf)
+}
+
+fn parse_status(response: &[u8]) -> u16 {
+    let text = String::from_utf8_lossy(response);
+    text.lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Build and send a GET with an arbitrary raw request-target (path), used to
+/// drive the path-confusion vectors verbatim. `extra_headers` are appended
+/// after the fixed Host/Connection headers.
+pub async fn raw_get(addr: SocketAddr, target: &str, extra_headers: &[(&str, &str)]) -> u16 {
+    let mut req = format!(
+        "GET {target} HTTP/1.1\r\nHost: passway.test\r\nConnection: close\r\n"
+    );
+    for (k, v) in extra_headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    send_raw(addr, req.as_bytes()).await
 }
 
 /// Start a real pingora `Server` running `proxy` on plaintext TCP at

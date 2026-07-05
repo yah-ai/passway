@@ -34,14 +34,20 @@
 //! 2. **Encoded separator → reject** (FIX 1). `%2f`/`%2F` (encoded `/`) or
 //!    `%5c`/`%5C` (encoded `\`) inside a segment is genuinely ambiguous —
 //!    whether the upstream treats it as a separator or literal text can't be
-//!    known here — so it can't be safely normalized. Reject. Also caught on
-//!    the once-decoded form so a double-encoded `%252f` fails closed too.
-//! 3. **Percent-decode once**, then normalize per RFC 3986 §5.2.4 /
-//!    §6.2.2: collapse duplicate slashes, resolve `.`/`..` segments
-//!    (clamped at root). Case is preserved in the canonical output; the
-//!    case-insensitive comparison lives in
+//!    known here — so it can't be safely normalized. Reject.
+//! 3. **Percent-decode once**, then reject a *surviving* encoded structural
+//!    character (`%2f`/`%5c` separator or `%2e` dot) in the decoded form.
+//!    After one RFC-conformant decode, a residual `%2f`/`%2e`/`%5c` can only
+//!    have come from double-encoding (`%252f`/`%252e`/`%255c`), whose sole
+//!    purpose is to reach a non-conformant double-decoding upstream as a
+//!    separator or dot-segment. Separator and dot are checked **symmetrically**
+//!    — otherwise a double-encoded dot fails open on a double-decoder while a
+//!    double-encoded slash fails closed.
+//! 4. **Normalize** per RFC 3986 §5.2.4 / §6.2.2: collapse duplicate
+//!    slashes, resolve `.`/`..` segments (clamped at root). Case is preserved
+//!    in the canonical output; the case-insensitive comparison lives in
 //!    [`RouteAuthPolicy::auth_required_for`](crate::auth::RouteAuthPolicy::auth_required_for).
-//! 4. **Literal backslash or traversal residue → reject.** A backslash is
+//! 5. **Literal backslash or traversal residue → reject.** A backslash is
 //!    treated as a separator by some servers; any `.`/`..` still present
 //!    after normalization is unresolved ambiguity. Both fail closed.
 //!
@@ -50,6 +56,18 @@
 //! could diverge into a protected prefix is rejected above, and the
 //! remaining normalizations (case via the matcher, slashes, dot-segments)
 //! match what a conformant upstream resolves, forwarding raw is safe.
+//!
+//! ## Encoding-depth scope
+//!
+//! This canonicalizer defends against **single- and double-encoding** of
+//! structural characters against a conformant-or-double-decoding upstream:
+//! one decode pass plus the post-decode residual-encoding reject covers the
+//! `%2e`/`%2f`/`%5c` (single) and `%252e`/`%252f`/`%255c` (double) forms.
+//! **Triple-and-higher** encoding (`%25252e`) survives even this and would
+//! only bite an upstream that decodes three-plus times — not a realistic
+//! threat, so it is intentionally out of v0 scope. A deployment that fronts a
+//! known multi-decoding upstream should additionally reject any residual
+//! `%`+hex after the decode pass (a deployment config knob, not built here).
 
 use percent_encoding::percent_decode_str;
 
@@ -93,9 +111,20 @@ pub fn canonical_path_for_auth(raw_path: &str) -> Option<String> {
     // once decoded (e.g. `%ff`) are rejected — same reasoning as FIX 2.
     let decoded = percent_decode_str(raw_path).decode_utf8().ok()?;
 
-    // (2, defense in depth) A double-encoded separator (`%252f` -> `%2f`) or
-    // any literal backslash resolves to an ambiguous separator; fail closed.
-    if contains_encoded_separator(&decoded) || decoded.contains('\\') {
+    // (2, defense in depth) After one RFC-conformant decode, a SURVIVING
+    // encoded structural character means the input was multiply-encoded
+    // around it — a `%252f`/`%252e`/`%255c` that decoded once to a literal
+    // `%2f`/`%2e`/`%5c`. Such an input has no legitimate purpose: it exists
+    // only to survive to a non-conformant double-decoding upstream that would
+    // then read it as a separator (`/`, `\`) or a dot-segment (`.`/`..`). So
+    // reject an encoded separator OR an encoded dot in the decoded form — the
+    // two must be symmetric, or a double-encoded dot fails OPEN on a
+    // double-decoder while a double-encoded slash fails closed. A literal
+    // backslash (some servers treat `\` as `/`) is rejected the same way.
+    if contains_encoded_separator(&decoded)
+        || contains_encoded_dot(&decoded)
+        || decoded.contains('\\')
+    {
         return None;
     }
 
@@ -120,6 +149,19 @@ fn contains_encoded_separator(s: &str) -> bool {
             (hi == b'2' && lo == b'f') || (hi == b'5' && lo == b'c')
         }
     })
+}
+
+/// `true` if `s` contains `%2e`/`%2E` (encoded `.`), matched
+/// case-insensitively on the hex digit. Applied only to the once-decoded
+/// form: a `%2e` in the raw path is a legitimate single-encoded dot that
+/// decodes to `.` and normalizes normally; a `%2e` still present *after* one
+/// decode means the raw was `%252e` (double-encoded), which only serves to
+/// survive to a double-decoding upstream as a dot-segment. See
+/// [`canonical_path_for_auth`]'s post-decode check.
+fn contains_encoded_dot(s: &str) -> bool {
+    s.as_bytes()
+        .windows(3)
+        .any(|w| w[0] == b'%' && w[1] == b'2' && w[2].to_ascii_lowercase() == b'e')
 }
 
 /// RFC 3986 §5.2.4-style path normalization: split on `/`, drop empty
@@ -238,6 +280,26 @@ mod tests {
     fn double_encoded_slash_is_rejected() {
         // %252f decodes once to %2f, which the decoded-form re-scan catches.
         assert_eq!(canon("/foo%252fadmin"), None);
+    }
+
+    #[test]
+    fn double_encoded_dot_is_rejected() {
+        // %252e decodes once to a literal %2e — inert to normalize_path, so it
+        // would survive as an anonymous-looking segment and let a
+        // double-decoding upstream resolve /public/%252e%252e/admin to /admin.
+        // Must fail closed, symmetric with the double-encoded-slash case.
+        assert_eq!(canon("/public/%252e%252e/admin"), None);
+        assert_eq!(canon("/foo%252eadmin"), None);
+        assert_eq!(canon("/foo%252Eadmin"), None); // case-insensitive hex
+    }
+
+    #[test]
+    fn single_encoded_dot_is_not_rejected_but_normalizes() {
+        // A single %2e is a legitimate encoded '.', decodes to '.', and
+        // normalizes away — it must NOT be rejected (that would be
+        // over-strict), only double-encoding is the attack.
+        assert_eq!(canon("/public/%2e%2e/admin").as_deref(), Some("/admin"));
+        assert_eq!(canon("/%2e/admin").as_deref(), Some("/admin"));
     }
 
     #[test]

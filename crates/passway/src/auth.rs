@@ -197,6 +197,31 @@ mod tests {
     }
 
     #[test]
+    fn matching_is_case_insensitive() {
+        // FIX 1: a protected prefix must catch its case variants — an
+        // upstream that case-folds resolves /Admin to the protected /admin.
+        let p = RouteAuthPolicy::new().require_auth("/admin");
+        assert!(p.auth_required_for("/Admin"));
+        assert!(p.auth_required_for("/ADMIN/secret"));
+        assert!(p.auth_required_for("/aDmIn/secret"));
+
+        // And a protected prefix declared in mixed case still catches lower.
+        let p2 = RouteAuthPolicy::new().require_auth("/API");
+        assert!(p2.auth_required_for("/api/private"));
+    }
+
+    #[test]
+    fn has_protected_prefix_reflects_require_auth_rules() {
+        assert!(!RouteAuthPolicy::new().has_protected_prefix());
+        assert!(!RouteAuthPolicy::new()
+            .allow_anonymous("/public")
+            .has_protected_prefix());
+        assert!(RouteAuthPolicy::new()
+            .require_auth("/admin")
+            .has_protected_prefix());
+    }
+
+    #[test]
     fn bearer_from_headers_extracts_token() {
         let mut h = HeaderMap::new();
         h.insert(
