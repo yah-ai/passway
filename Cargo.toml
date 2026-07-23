@@ -10,11 +10,11 @@
 # reserve-crate-names.sh or `cargo publish` here; that is the operator's
 # move, not this ticket's.
 [workspace]
-members = ["crates/passway"]
+members = ["crates/passway", "crates/acme-engine"]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.18"
+version = "0.8.21"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"

@@ -37,26 +37,20 @@ serde_json = "1"
 log = "0.4"
 env_logger = "0.11"
 
-# R594-F7: automated Let's Encrypt (ACME/RFC-8555) issuance + renewal for
-# tls::TlsMode::Acme. Apache-2.0 (permissive — verified via `cargo info
-# instant-acme` and `cargo deny check`). `default-features = false` drops
-# the crate's own default `aws-lc-rs` crypto backend in favor of `ring`
-# (feature "ring") to match the provider `pingora-rustls` installs at
-# runtime (`pingora_rustls::install_default_crypto_provider()`), so this
-# dependency declaration doesn't add its own, separate reason to need
-# `aws-lc-rs` — note that doesn't make `aws-lc-rs` vanish from the build:
-# pingora-rustls 0.8.1's own manifest depends on `rustls` without disabling
-# default features, so `aws_lc_rs` (one of `rustls`'s own defaults) is
-# already compiled in via plain `pingora` regardless of this crate; see
-# acme.rs's module doc for how that was confirmed. `hyper-rustls` is
-# instant-acme's built-in HTTPS client (talks to the ACME directory over
-# rustls, never native-tls); `rcgen` lets `Order::finalize()` generate the
-# end-entity keypair + CSR so this crate never hand-rolls X.509. See
-# acme.rs's module doc for the full crate-choice + challenge-type
+# R594-F7 / R600-F3: automated Let's Encrypt (ACME/RFC-8555) issuance +
+# renewal for tls::TlsMode::Acme. The provider-agnostic issuance engine now
+# lives in the sibling `acme-engine` crate (extracted so a second workspace
+# can consume it); this crate is the pingora deployment shell over it —
+# env-config parsing, the HTTP-01 responder, cert-to-disk writes, and the
+# `BackgroundService` renewal loop. See acme.rs's module doc for the shell's
 # rationale (HTTP-01, not TLS-ALPN-01 — pingora's static rustls
 # `TlsSettings` can't serve a dynamic per-ALPN challenge cert on the same
-# port the production listener already owns).
-instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
+# port the production listener already owns) and acme-engine's module doc
+# for the instant-acme crate-choice rationale.
+# R635: published as `passway-acme` (the `acme-engine` name on crates.io is an
+# unrelated crate). The alias keeps `use acme_engine::…` in this crate's source
+# unchanged; the `version` req is what crates.io requires of a path dep.
+acme-engine = { package = "passway-acme", path = "../acme-engine", version = "0.8.21" }
 
 # cheers-verify edge auth (R594-F4 V0 MUST #3): PasetoV4PublicVerifier +
 # McpClaims, path+version dep into the co-developed oss/cheers workspace —
@@ -64,12 +58,15 @@ instant-acme = { version = "0.8.5", default-features = false, features = ["ring"
 # in-tree consumer of cheers-verify outside the cheers workspace itself)
 # already uses. cheers-verify holds no minter (edge-safe by construction),
 # so a compromised passway process cannot forge a session.
-cheers-core = { path = "../../../cheers/crates/cheers-core", version = "0.8.18" }
-cheers-verify = { path = "../../../cheers/crates/cheers-verify", version = "0.8.18" }
+cheers-core = { path = "../../../cheers/crates/cheers-core", version = "0.8.21" }
+cheers-verify = { path = "../../../cheers/crates/cheers-verify", version = "0.8.21" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-# rustls-tls only, no native-tls — matches this crate's all-rustls posture
-# even in the test HTTP client.
-reqwest = { version = "0.12", features = ["rustls-tls", "http2", "json"], default-features = false }
 pasetors = "0.7"
+# HTTP client for the integration tests (tests/*.rs drive the running proxy
+# over loopback). rustls-tls only, no native-tls — matches this crate's
+# all-rustls posture and deny.toml's TLS-backend bans. (Was a normal dep
+# while acme.rs owned the Cloudflare DNS-01 client; that moved to the
+# `acme-engine` crate in R600-F3, leaving reqwest a test-only need here.)
+reqwest = { version = "0.12", features = ["rustls-tls", "http2", "json"], default-features = false }

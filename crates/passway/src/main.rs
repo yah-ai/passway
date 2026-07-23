@@ -12,9 +12,13 @@
 //! | `PASSWAY_TLS_CERT` | PEM cert chain path | required |
 //! | `PASSWAY_TLS_KEY` | PEM private key path | required |
 //! | `PASSWAY_TLS_MODE` | `manual` (bring-your-own-cert) or `acme` (R594-F7) | `manual` |
-//! | `PASSWAY_ACME_DOMAIN` | domain to issue for | required if `PASSWAY_TLS_MODE=acme` |
+//! | `PASSWAY_ACME_DOMAIN` | comma-separated SAN list to issue for (wildcards need `dns-01`) | required if `PASSWAY_TLS_MODE=acme` |
 //! | `PASSWAY_ACME_CONTACT_EMAIL` | ACME account contact | required if `PASSWAY_TLS_MODE=acme` |
 //! | `PASSWAY_ACME_DIRECTORY` | `production`, `staging`, or a custom ACME directory URL (Pebble/step-ca) | `staging` |
+//! | `PASSWAY_ACME_CHALLENGE` | `http-01` or `dns-01` (Cloudflare; required for wildcard domains) | `http-01` |
+//! | `PASSWAY_ACME_DNS01_CLOUDFLARE_TOKEN_FILE` | path to a file holding a CF API token with `DNS:Edit` on the zone | required if `dns-01` |
+//! | `PASSWAY_ACME_DNS01_CLOUDFLARE_ZONE_ID` | CF zone ID the `_acme-challenge` TXT records are created in | required if `dns-01` |
+//! | `PASSWAY_ACME_DNS01_PROPAGATION_SECS` | wait between publishing a TXT record and asking the CA to validate | `10` |
 //! | `PASSWAY_ACME_ACCOUNT_CACHE` | path to cache ACME account credentials (JSON) | `<PASSWAY_TLS_CERT>.acme-account.json` |
 //! | `PASSWAY_ACME_HTTP01_BIND` | address the HTTP-01 challenge responder binds | `0.0.0.0:80` |
 //! | `PASSWAY_ACME_RENEW_BEFORE_DAYS` | renew when within this many days of expiry | `30` |
