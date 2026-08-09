@@ -10,8 +10,31 @@
 //! caller (a health-check prober) doesn't need to distinguish "no capacity"
 //! from "intentionally leaving rotation," it just needs to stop sending
 //! traffic here.
+//!
+//! ## Aggregate node readiness, per-host detail (R594-F10)
+//!
+//! With one node fronting several services ([`crate::routing`]) the top-level
+//! `ready` stays an **aggregate**: 200 while *any* upstream set can serve.
+//! That is deliberate. This endpoint gates a floating-IP / DNS health check,
+//! whose only lever is "is this node in rotation" — so reporting unready
+//! because one of three services is down would take the two healthy ones
+//! down with it, on every node at once (a service that's down is usually
+//! down everywhere, not on one node). The per-set breakdown in
+//! [`ReadinessBody::upstreams_by_host`] is what a *per-service* prober reads
+//! instead; it's omitted entirely from the JSON for a single-set deployment,
+//! so that body is byte-identical to the pre-R594-F10 one.
 
 use serde::Serialize;
+
+/// Ready/total upstream counts for one host's upstream set. `host` is the
+/// routed hostname, or [`crate::routing::CATCH_ALL_LABEL`] for the catch-all
+/// set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HostReadiness {
+    pub host: String,
+    pub ready_upstreams: usize,
+    pub total_upstreams: usize,
+}
 
 /// The `/health` response body. `Serialize` only — this module never talks
 /// to a pingora `Session` directly (kept testable without a live proxy);
@@ -22,6 +45,9 @@ pub struct ReadinessBody {
     pub ready_upstreams: usize,
     pub total_upstreams: usize,
     pub draining: bool,
+    /// Per-host-set counts, present only when this node routes by host.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub upstreams_by_host: Vec<HostReadiness>,
 }
 
 impl ReadinessBody {
@@ -37,7 +63,16 @@ impl ReadinessBody {
             ready_upstreams,
             total_upstreams,
             draining,
+            upstreams_by_host: Vec::new(),
         }
+    }
+
+    /// Attach the per-host-set breakdown (R594-F10). Does not change
+    /// [`Self::ready`] — see this module's doc for why node readiness stays
+    /// an aggregate.
+    pub fn with_hosts(mut self, upstreams_by_host: Vec<HostReadiness>) -> Self {
+        self.upstreams_by_host = upstreams_by_host;
+        self
     }
 
     /// The HTTP status this body should be served with: 200 only when
@@ -94,5 +129,40 @@ mod tests {
         assert_eq!(v["ready_upstreams"], 1);
         assert_eq!(v["total_upstreams"], 2);
         assert_eq!(v["draining"], false);
+        // A single-set deployment's body is unchanged by R594-F10.
+        assert!(v.get("upstreams_by_host").is_none());
+    }
+
+    #[test]
+    fn per_host_breakdown_is_reported_when_present() {
+        let b = ReadinessBody::new(1, 3, false).with_hosts(vec![
+            HostReadiness {
+                host: "a.example.com".into(),
+                ready_upstreams: 1,
+                total_upstreams: 1,
+            },
+            HostReadiness {
+                host: "b.example.com".into(),
+                ready_upstreams: 0,
+                total_upstreams: 2,
+            },
+        ]);
+        let v = serde_json::to_value(&b).unwrap();
+        assert_eq!(v["upstreams_by_host"][0]["host"], "a.example.com");
+        assert_eq!(v["upstreams_by_host"][1]["ready_upstreams"], 0);
+    }
+
+    #[test]
+    fn node_stays_ready_while_one_host_set_is_fully_down() {
+        // The aggregate gate: b is dark, a still serves, so the node stays in
+        // floating-IP rotation and b's outage is visible in the breakdown
+        // rather than by pulling a's traffic too.
+        let b = ReadinessBody::new(1, 3, false).with_hosts(vec![HostReadiness {
+            host: "b.example.com".into(),
+            ready_upstreams: 0,
+            total_upstreams: 2,
+        }]);
+        assert!(b.ready);
+        assert_eq!(b.status_code(), 200);
     }
 }

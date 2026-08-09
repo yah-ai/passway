@@ -26,7 +26,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 use passway::auth::{CheersAuth, RouteAuthPolicy};
 use passway::proxy::PassProxy;
-use passway::upstream::{build_load_balancer, StaticUpstreams};
+use passway::routing::{build_host_router, HostKey};
+use passway::upstream::{build_load_balancer, StaticUpstreams, UpstreamSource};
 
 /// Reserve an ephemeral local port and immediately release it. Small
 /// TOCTOU race accepted (standard practice for this kind of test harness).
@@ -42,13 +43,23 @@ pub fn free_addr() -> SocketAddr {
 /// etc.) before they ever hit the proxy. Bytes-in so a non-UTF-8 path can be
 /// sent verbatim.
 pub async fn send_raw(addr: SocketAddr, raw_request: &[u8]) -> u16 {
+    send_raw_full(addr, raw_request).await.0
+}
+
+/// [`send_raw`], but also returning the whole response as lossy text — for
+/// assertions on response headers (e.g. which upstream answered) that a bare
+/// status code can't make.
+pub async fn send_raw_full(addr: SocketAddr, raw_request: &[u8]) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).await.expect("connect to proxy");
     stream.write_all(raw_request).await.expect("write request");
     let mut buf = Vec::new();
     // We send `Connection: close`, so read_to_end gets the whole response
     // then EOF. Guard with a timeout so a hang fails the test loudly.
     let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut buf)).await;
-    parse_status(&buf)
+    (
+        parse_status(&buf),
+        String::from_utf8_lossy(&buf).into_owned(),
+    )
 }
 
 fn parse_status(response: &[u8]) -> u16 {
@@ -87,6 +98,22 @@ pub fn start_proxy(
     >,
     listen: SocketAddr,
 ) {
+    start_proxy_multi(proxy, vec![lb_background], listen);
+}
+
+/// [`start_proxy`] for a host-routed proxy, which has one background service
+/// per upstream set (R594-F10). Every one of them must be added to the
+/// server, or that set's discovery/health-check timers never fire and it
+/// stays permanently unready.
+pub fn start_proxy_multi(
+    proxy: PassProxy,
+    lb_backgrounds: Vec<
+        pingora::services::background::GenBackgroundService<
+            pingora::lb::LoadBalancer<pingora::lb::selection::RoundRobin>,
+        >,
+    >,
+    listen: SocketAddr,
+) {
     std::thread::spawn(move || {
         let mut server = Server::new(None).expect("construct pingora Server");
         server.bootstrap();
@@ -95,7 +122,9 @@ pub fn start_proxy(
         proxy_service.add_tcp(&listen.to_string());
 
         server.add_service(proxy_service);
-        server.add_service(lb_background);
+        for lb_background in lb_backgrounds {
+            server.add_service(lb_background);
+        }
         server.run_forever();
     });
 
@@ -114,11 +143,55 @@ pub fn build_proxy(
         pingora::lb::LoadBalancer<pingora::lb::selection::RoundRobin>,
     >,
 ) {
-    let source = Arc::new(StaticUpstreams::new(addrs));
+    build_proxy_with_source(Arc::new(StaticUpstreams::new(addrs)))
+}
+
+/// [`build_proxy`] over an arbitrary [`UpstreamSource`] — the seam itself,
+/// exercised by `tests/yubaba_discovery.rs` with
+/// `passway::discovery::YubabaUpstreams`. Same fast 100ms health/update ticks,
+/// which for a dynamic source also sets how often it re-polls.
+pub fn build_proxy_with_source(
+    source: Arc<dyn UpstreamSource>,
+) -> (
+    PassProxy,
+    pingora::services::background::GenBackgroundService<
+        pingora::lb::LoadBalancer<pingora::lb::selection::RoundRobin>,
+    >,
+) {
     let lb = build_load_balancer(source, Duration::from_millis(100), Duration::from_millis(100));
     let lb_background = background_service("test upstream health", lb);
     let proxy = PassProxy::new(lb_background.task());
     (proxy, lb_background)
+}
+
+/// Build a host-routed `PassProxy` (R594-F10): one static upstream set per
+/// [`HostKey`], each with its own load balancer and background service. Same
+/// fast 100ms health/update ticks as [`build_proxy`].
+pub fn build_host_routed_proxy(
+    sets: Vec<(HostKey, Vec<SocketAddr>)>,
+) -> (
+    PassProxy,
+    Vec<
+        pingora::services::background::GenBackgroundService<
+            pingora::lb::LoadBalancer<pingora::lb::selection::RoundRobin>,
+        >,
+    >,
+) {
+    let sources: Vec<(HostKey, Arc<dyn UpstreamSource>)> = sets
+        .into_iter()
+        .map(|(key, addrs)| {
+            (
+                key,
+                Arc::new(StaticUpstreams::new(addrs)) as Arc<dyn UpstreamSource>,
+            )
+        })
+        .collect();
+    let (router, services) = build_host_router(
+        sources,
+        Duration::from_millis(100),
+        Duration::from_millis(100),
+    );
+    (PassProxy::routed(router), services)
 }
 
 /// Like [`build_proxy`], but with cheers-verify edge auth wired in via

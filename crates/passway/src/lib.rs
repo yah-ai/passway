@@ -21,6 +21,17 @@
 //! - [`upstream`] — the pluggable [`upstream::UpstreamSource`] seam plus
 //!   the v0 [`upstream::StaticUpstreams`] implementation and the
 //!   `pingora::lb::LoadBalancer` builder.
+//! - [`discovery`] — R594-F8: [`discovery::YubabaUpstreams`], the dynamic
+//!   [`upstream::UpstreamSource`] that learns the backend set from yubaba's
+//!   service-record surface. This is what makes passway an ingress
+//!   *provider* — the sovereign twin of the cloudflared arm — rather than a
+//!   proxy someone hand-configured with an address list.
+//! - [`routing`] — R594-F10: [`routing::HostRouter`], the host →
+//!   upstream-set map that lets one node front several services. Sits above
+//!   the [`upstream`] seam (N sources, N load balancers) rather than
+//!   replacing it.
+//! - [`host`] — request-authority extraction and normalization for that map
+//!   (`Host` / `:authority`, fail-closed on an ambiguous authority).
 //! - [`auth`] — `cheers-verify` wiring ([`auth::CheersAuth`]) and the
 //!   per-route auth policy ([`auth::RouteAuthPolicy`]).
 //! - [`hardening`] — the request-smuggling defenses (hop-by-hop header
@@ -56,16 +67,22 @@
 
 pub mod acme;
 pub mod auth;
+pub mod discovery;
 pub mod hardening;
 pub mod health;
+pub mod host;
 pub mod path;
 pub mod proxy;
+pub mod routing;
 pub mod tls;
 pub mod upstream;
 
 pub use acme::{AcmeConfig, AcmeDirectory, AcmeRenewalService};
 pub use auth::{CheersAuth, RouteAuthPolicy};
-pub use health::ReadinessBody;
+pub use discovery::{YubabaDiscoveryConfig, YubabaUpstreams};
+pub use health::{HostReadiness, ReadinessBody};
+pub use host::{request_host, HostOutcome};
 pub use proxy::PassProxy;
+pub use routing::{build_host_router, HostKey, HostRouter};
 pub use tls::TlsMode;
 pub use upstream::{StaticUpstreams, UpstreamSource};

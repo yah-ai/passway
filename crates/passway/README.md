@@ -32,7 +32,7 @@ PASSWAY_UPSTREAMS=10.0.0.1:8080,10.0.0.2:8080 \
 | `PASSWAY_LISTEN` | TLS listener address | `0.0.0.0:443` |
 | `PASSWAY_TLS_CERT` | PEM cert chain path | required |
 | `PASSWAY_TLS_KEY` | PEM private key path | required |
-| `PASSWAY_UPSTREAMS` | comma-separated `host:port` list | empty (fail-ready 503) |
+| `PASSWAY_UPSTREAMS` | comma-separated backend list, optionally `<hostname>=` prefixed (see below) | empty (fail-ready 503) |
 | `PASSWAY_UPSTREAM_TLS` | speak TLS to upstreams | `false` |
 | `PASSWAY_UPSTREAM_SNI` | SNI when `PASSWAY_UPSTREAM_TLS=true` | empty |
 | `PASSWAY_HEALTH_PATH` | readiness path | `/health` |
@@ -48,6 +48,30 @@ Auth is off until `PASSWAY_AUTH_PUBLIC_KEY_FILE` is set; an empty upstream set
 fails *ready* (reports `/health` unready) rather than crashing, so a cold start
 is not an outage.
 
+### Fronting several services from one node
+
+Prefix an entry with `<hostname>=` to give that hostname its own upstream set;
+repeat the hostname to add addresses to it. Requests are routed by authority
+(`Host` / `:authority`), and each set is round-robined and health-checked
+independently:
+
+```bash
+PASSWAY_UPSTREAMS=marketing.example.com=10.0.0.1:8080,\
+marketing.example.com=10.0.0.2:8080,\
+analytics.example.com=10.0.0.3:9000
+```
+
+An authority no entry names gets a 503 — never another service's backends. To
+serve unmatched authorities anyway, declare a catch-all explicitly with the
+reserved `*=` prefix. Unprefixed entries are the single-set form and become the
+catch-all; *mixing* unprefixed and `<hostname>=` entries is rejected at boot,
+because an accidental catch-all on a multi-tenant front door is a cross-tenant
+leak waiting to happen. On a host-routed instance `/health` also reports a
+per-hostname `upstreams_by_host` breakdown.
+
+Routing is on the HTTP authority, not TLS SNI: pingora's rustls backend does
+not surface the negotiated server name to the proxy (see `src/host.rs`).
+
 ## Use it as a library
 
 The binary is the thinnest possible wiring of a reusable library. Embed the
@@ -57,6 +81,8 @@ proxy in your own `pingora::server::Server`:
   gate, hardening, `/health`).
 - `UpstreamSource` / `StaticUpstreams` — the pluggable upstream seam; implement
   `UpstreamSource` to feed peers from your own control plane.
+- `HostRouter` / `build_host_router` — the host → upstream-set map above that
+  seam, for one node fronting several services.
 - `CheersAuth` / `RouteAuthPolicy` — `cheers-verify` wiring and per-route auth
   policy.
 - `TlsMode` — TLS listener configuration (bring-your-own-cert today, with an

@@ -3,23 +3,28 @@
 //! [`UpstreamSource`] is the seam: implement it, hand an `Arc<dyn
 //! UpstreamSource>` to [`build_load_balancer`], and the rest of this crate
 //! (`proxy::PassProxy`, the round-robin selection, the TCP health checks)
-//! never changes. V0 ships exactly one implementation, [`StaticUpstreams`]
-//! — a fixed, config-supplied address list.
+//! never changes. Two implementations ship: [`StaticUpstreams`] — a fixed,
+//! config-supplied address list, still the default — and
+//! [`crate::discovery::YubabaUpstreams`], which learns the set from
+//! yubaba.
 //!
-//! ## Why not dynamic yet
+//! ## The dynamic source (R594-F8)
 //!
-//! The obvious dynamic source is R594-F3's yubaba `ServiceRecords` (a
-//! push-on-change, in-process registry of `workload -> mesh-IP:port` +
-//! health, homed in `oss/yubaba/crates/yubaba/src/service_records.rs`).
-//! Wiring it in today is impossible, not just deferred: `ServiceRecords`
-//! has **no network surface** — it is an in-process `tokio::sync::watch`
-//! registry inside yubaba's own server process, and nothing publishes it
-//! over HTTP/gRPC/anything passway (a separate binary, typically on a
-//! different rented-doorknob node) could reach. That surface is R594-F6's
-//! job. Once it exists, a `YubabaUpstreams` implementing [`UpstreamSource`]
-//! (poll or subscribe over that surface, filter to `Health::is_ready`,
-//! return the `mesh_ip:port` set) drops in here without touching
-//! `proxy.rs`, `main.rs`'s TLS/auth wiring, or any test in this crate.
+//! The dynamic source is yubaba's `ServiceRecords` (a push-on-change,
+//! in-process registry of `workload -> mesh-IP:port` + health, homed in
+//! `oss/yubaba/crates/yubaba/src/service_records.rs`). Until R594-F8 it had
+//! **no network surface** — it was an in-process `tokio::sync::watch`
+//! registry inside yubaba's own server process, unreachable from passway (a
+//! separate binary, typically on a different rented-doorknob node). It now
+//! serves `GET /service-records?ready=true`, and
+//! [`crate::discovery::YubabaUpstreams`] consumes it. That landed here
+//! exactly as this seam predicted: without touching `proxy.rs`, `main.rs`'s
+//! TLS/auth wiring, or any pre-existing test in this crate.
+//!
+//! Which source is in play is a `main.rs` env decision
+//! (`PASSWAY_UPSTREAM_SOURCE`), and neither is deprecated: static needs no
+//! control plane at all, dynamic is what makes passway an ingress
+//! *provider*.
 //!
 //! ## Empty is not an error
 //!

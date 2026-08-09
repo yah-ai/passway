@@ -50,7 +50,7 @@ env_logger = "0.11"
 # R635: published as `passway-acme` (the `acme-engine` name on crates.io is an
 # unrelated crate). The alias keeps `use acme_engine::…` in this crate's source
 # unchanged; the `version` req is what crates.io requires of a path dep.
-acme-engine = { package = "passway-acme", path = "../acme-engine", version = "0.8.21" }
+acme-engine = { package = "passway-acme", path = "../acme-engine", version = "0.8.22" }
 
 # cheers-verify edge auth (R594-F4 V0 MUST #3): PasetoV4PublicVerifier +
 # McpClaims, path+version dep into the co-developed oss/cheers workspace —
@@ -58,15 +58,17 @@ acme-engine = { package = "passway-acme", path = "../acme-engine", version = "0.
 # in-tree consumer of cheers-verify outside the cheers workspace itself)
 # already uses. cheers-verify holds no minter (edge-safe by construction),
 # so a compromised passway process cannot forge a session.
-cheers-core = { path = "../../../cheers/crates/cheers-core", version = "0.8.21" }
-cheers-verify = { path = "../../../cheers/crates/cheers-verify", version = "0.8.21" }
+cheers-core = { path = "../../../cheers/crates/cheers-core", version = "0.8.22" }
+cheers-verify = { path = "../../../cheers/crates/cheers-verify", version = "0.8.22" }
+
+# HTTP client, two uses: `discovery.rs`'s poll of yubaba's service-record
+# surface (R594-F8) and the integration tests, which drive the running proxy
+# over loopback. rustls-tls only, no native-tls — matches this crate's
+# all-rustls posture and deny.toml's TLS-backend bans. Already in the
+# workspace graph via `acme-engine`'s DNS-01 client, so this adds no new
+# transitive surface. (It was dev-only between R600-F3 and R594-F8.)
+reqwest = { version = "0.12", features = ["rustls-tls", "http2", "json"], default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 pasetors = "0.7"
-# HTTP client for the integration tests (tests/*.rs drive the running proxy
-# over loopback). rustls-tls only, no native-tls — matches this crate's
-# all-rustls posture and deny.toml's TLS-backend bans. (Was a normal dep
-# while acme.rs owned the Cloudflare DNS-01 client; that moved to the
-# `acme-engine` crate in R600-F3, leaving reqwest a test-only need here.)
-reqwest = { version = "0.12", features = ["rustls-tls", "http2", "json"], default-features = false }
