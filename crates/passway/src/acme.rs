@@ -197,6 +197,13 @@ pub fn parse_acme_config(
             zone_id: get("PASSWAY_ACME_DNS01_CLOUDFLARE_ZONE_ID").ok_or(
                 "PASSWAY_ACME_DNS01_CLOUDFLARE_ZONE_ID is required when PASSWAY_ACME_CHALLENGE=dns-01",
             )?,
+            // R779: unset is the ordinary case (we hold the zone named by
+            // ZONE_ID). Set it when the identifier's zone belongs to someone
+            // else and they have CNAMEd `_acme-challenge.<domain>` into a zone
+            // we do hold — see `acme_engine::dns01_record_name`.
+            delegate_zone: get("PASSWAY_ACME_DNS01_DELEGATE_ZONE")
+                .map(|z| z.trim().to_string())
+                .filter(|z| !z.is_empty()),
         },
         other => {
             return Err(format!(
@@ -441,6 +448,16 @@ pub async fn ensure_cert_on_disk(config: &AcmeConfig) -> Result<(), AcmeError> {
         );
         return Ok(());
     }
+    if let Some(remaining) = issuance_backoff_remaining(config, SystemTime::now()) {
+        return Err(AcmeError::Config(format!(
+            "passway acme: a previous issuance for [{}] failed and the backoff has {}s left \
+             (marker {}) — not ordering again yet, so a broken DNS record cannot burn the \
+             CA's failed-validation budget; delete the marker to force a retry",
+            config.domains.join(", "),
+            remaining.as_secs(),
+            failure_marker_path(config).display()
+        )));
+    }
 
     log::warn!(
         "passway acme: no usable cert at {} for [{}] — blocking startup on a first ACME issuance \
@@ -467,7 +484,92 @@ pub async fn ensure_cert_on_disk(config: &AcmeConfig) -> Result<(), AcmeError> {
     if let Some(task) = accept_task {
         task.abort();
     }
+    match &result {
+        Ok(()) => clear_issuance_failure(config),
+        Err(_) => record_issuance_failure(config, SystemTime::now()),
+    }
     result
+}
+
+// ---------------------------------------------------------------------------
+// Issuance failure backoff (R779)
+// ---------------------------------------------------------------------------
+//
+// Under kamaji's on-demand JIT tier a passway that fails its first-boot
+// issuance exits, kamaji re-forks it on the very next connection, and it
+// tries again — as fast as clients arrive, straight into Let's Encrypt's
+// 5 authorization failures / hour / identifier. certmagic has no negative
+// cache (checked 2026-08-28; it relies on its `ask` gate plus the CA's own
+// limit), so this one is ours: a marker file beside the cert records the
+// last failure and a backoff that doubles from
+// `FAILURE_BACKOFF_INITIAL` up to `FAILURE_BACKOFF_MAX`. A boot that finds
+// an unexpired marker refuses to order (`ensure_cert_on_disk` returns
+// `Err`, the process exits) and the kernel accept queue on kamaji's held
+// socket simply waits for the next fork. Deleting the marker forces a
+// retry; a successful issuance clears it.
+
+/// First backoff after a failed issuance.
+pub const FAILURE_BACKOFF_INITIAL: Duration = Duration::from_secs(5 * 60);
+/// Backoff ceiling. One retry per hour keeps a permanently broken domain
+/// at ~24 orders/day against a 5/hour/identifier failure limit.
+pub const FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
+
+/// `<cert_path>.acme-failed`.
+pub fn failure_marker_path(config: &AcmeConfig) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}.acme-failed", config.cert_path))
+}
+
+/// Marker contents: `<failed_at_unix_secs> <backoff_secs>`.
+fn read_marker(path: &Path) -> Option<(u64, u64)> {
+    let s = std::fs::read_to_string(path).ok()?;
+    let mut it = s.split_whitespace();
+    let at = it.next()?.parse().ok()?;
+    let backoff = it.next()?.parse().ok()?;
+    Some((at, backoff))
+}
+
+fn unix_secs(t: SystemTime) -> u64 {
+    t.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// How much of the current backoff is still to run, or `None` if a new
+/// order may be placed. Pure over the marker file and `now`.
+pub fn issuance_backoff_remaining(config: &AcmeConfig, now: SystemTime) -> Option<Duration> {
+    let (failed_at, backoff) = read_marker(&failure_marker_path(config))?;
+    let until = failed_at.saturating_add(backoff);
+    let now = unix_secs(now);
+    (now < until).then(|| Duration::from_secs(until - now))
+}
+
+/// Record a failed issuance: writes the marker with the next backoff
+/// (doubling the previous one, capped at [`FAILURE_BACKOFF_MAX`]). Public
+/// so `main.rs` can record a *timeout* of the bootstrap the same way.
+pub fn record_issuance_failure(config: &AcmeConfig, now: SystemTime) {
+    let path = failure_marker_path(config);
+    let next = match read_marker(&path) {
+        Some((_, prev)) => Duration::from_secs(prev.saturating_mul(2)).min(FAILURE_BACKOFF_MAX),
+        None => FAILURE_BACKOFF_INITIAL,
+    };
+    let body = format!("{} {}\n", unix_secs(now), next.as_secs());
+    if let Err(e) = write_file_atomic(&path, body.as_bytes(), 0o644) {
+        log::warn!("passway acme: could not write failure marker {}: {e}", path.display());
+    } else {
+        log::warn!(
+            "passway acme: issuance failed; next attempt no sooner than {}s from now (marker {})",
+            next.as_secs(),
+            path.display()
+        );
+    }
+}
+
+/// A successful issuance forgets the failure history.
+pub fn clear_issuance_failure(config: &AcmeConfig) {
+    let path = failure_marker_path(config);
+    if let Err(e) = std::fs::remove_file(&path) {
+        if e.kind() != io::ErrorKind::NotFound {
+            log::warn!("passway acme: could not remove failure marker {}: {e}", path.display());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -572,6 +674,44 @@ mod tests {
     // their code into the `acme-engine` crate. What remains here covers the
     // deployment shell: the disk-checking renewal wrapper, the cert-to-disk
     // write, the HTTP-01 request parser, and env-config parsing.
+
+    // -- issuance failure backoff (R779) --------------------------------
+
+    #[test]
+    fn backoff_absent_then_doubles_then_caps_then_clears() {
+        let dir = tempfile_dir();
+        let config = test_config(&dir);
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert_eq!(issuance_backoff_remaining(&config, t0), None);
+
+        record_issuance_failure(&config, t0);
+        assert_eq!(issuance_backoff_remaining(&config, t0), Some(FAILURE_BACKOFF_INITIAL));
+        assert_eq!(
+            issuance_backoff_remaining(&config, t0 + Duration::from_secs(100)),
+            Some(FAILURE_BACKOFF_INITIAL - Duration::from_secs(100))
+        );
+        assert_eq!(issuance_backoff_remaining(&config, t0 + FAILURE_BACKOFF_INITIAL), None);
+
+        // Second failure doubles; keep failing until the cap holds.
+        record_issuance_failure(&config, t0);
+        assert_eq!(issuance_backoff_remaining(&config, t0), Some(FAILURE_BACKOFF_INITIAL * 2));
+        for _ in 0..10 {
+            record_issuance_failure(&config, t0);
+        }
+        assert_eq!(issuance_backoff_remaining(&config, t0), Some(FAILURE_BACKOFF_MAX));
+
+        clear_issuance_failure(&config);
+        assert_eq!(issuance_backoff_remaining(&config, t0), None);
+        clear_issuance_failure(&config); // idempotent
+    }
+
+    #[test]
+    fn corrupt_marker_means_no_backoff() {
+        let dir = tempfile_dir();
+        let config = test_config(&dir);
+        std::fs::write(failure_marker_path(&config), "garbage").unwrap();
+        assert_eq!(issuance_backoff_remaining(&config, SystemTime::now()), None);
+    }
 
     // -- cert_needs_renewal (IO wrapper) --------------------------------
 
@@ -774,7 +914,32 @@ mod tests {
             AcmeChallengeKind::Dns01Cloudflare {
                 token_file: "/etc/cf-token".to_string(),
                 zone_id: "zone123".to_string(),
+                delegate_zone: None,
             }
+        );
+    }
+
+    #[test]
+    fn parse_acme_config_carries_the_dns01_delegate_zone() {
+        let env = env_map(&[
+            ("PASSWAY_TLS_MODE", "acme"),
+            ("PASSWAY_ACME_DOMAIN", "shop.tenant.io"),
+            ("PASSWAY_ACME_CONTACT_EMAIL", "ops@example.com"),
+            ("PASSWAY_ACME_CHALLENGE", "dns-01"),
+            ("PASSWAY_ACME_DNS01_CLOUDFLARE_TOKEN_FILE", "/etc/cf-token"),
+            ("PASSWAY_ACME_DNS01_CLOUDFLARE_ZONE_ID", "zone123"),
+            ("PASSWAY_ACME_DNS01_DELEGATE_ZONE", " acme.yah.dev "),
+        ]);
+        let config =
+            parse_acme_config(|k| env.get(k).cloned(), "cert.pem".into(), "key.pem".into()).unwrap().unwrap();
+        assert_eq!(
+            config.challenge,
+            AcmeChallengeKind::Dns01Cloudflare {
+                token_file: "/etc/cf-token".to_string(),
+                zone_id: "zone123".to_string(),
+                delegate_zone: Some("acme.yah.dev".to_string()),
+            },
+            "the delegate zone is trimmed and carried through to the engine"
         );
     }
 

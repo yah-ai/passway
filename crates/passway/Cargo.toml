@@ -9,6 +9,14 @@ description = "Sovereign public-ingress L7 proxy (R594-F4 / W267 Tier-1): pingor
 keywords = ["proxy", "ingress", "pingora", "tls", "edge"]
 categories = ["network-programming", "web-programming::http-server"]
 readme = "README.md"
+# R743-T6: the 6 integration-test files under tests/ used to each build as
+# their own binary (autotests' default per-file discovery), so `common`
+# (tests/common/mod.rs) — plus pingora and the rest of this crate's dep
+# graph — got compiled fresh 6 times. They're consolidated into one binary
+# (tests/main.rs, mod'ing all 6 siblings + common once) built via the
+# explicit [[test]] below; autotests = false stops cargo from *also*
+# auto-discovering each tests/*.rs as its own binary on top of that.
+autotests = false
 
 # TRUST-BOUNDARY crate: public-facing listener + edge auth path. Pin
 # `pingora >= 0.8.1` (R594-S1 spike verdict — request-smuggling fix
@@ -50,7 +58,7 @@ env_logger = "0.11"
 # R635: published as `passway-acme` (the `acme-engine` name on crates.io is an
 # unrelated crate). The alias keeps `use acme_engine::…` in this crate's source
 # unchanged; the `version` req is what crates.io requires of a path dep.
-acme-engine = { package = "passway-acme", path = "../acme-engine", version = "0.8.22" }
+acme-engine = { package = "passway-acme", path = "../acme-engine", version = "0.8.29" }
 
 # cheers-verify edge auth (R594-F4 V0 MUST #3): PasetoV4PublicVerifier +
 # McpClaims, path+version dep into the co-developed oss/cheers workspace —
@@ -58,8 +66,8 @@ acme-engine = { package = "passway-acme", path = "../acme-engine", version = "0.
 # in-tree consumer of cheers-verify outside the cheers workspace itself)
 # already uses. cheers-verify holds no minter (edge-safe by construction),
 # so a compromised passway process cannot forge a session.
-cheers-core = { path = "../../../cheers/crates/cheers-core", version = "0.8.22" }
-cheers-verify = { path = "../../../cheers/crates/cheers-verify", version = "0.8.22" }
+cheers-core = { path = "../../../cheers/crates/cheers-core", version = "0.8.29" }
+cheers-verify = { path = "../../../cheers/crates/cheers-verify", version = "0.8.29" }
 
 # HTTP client, two uses: `discovery.rs`'s poll of yubaba's service-record
 # surface (R594-F8) and the integration tests, which drive the running proxy
@@ -69,6 +77,42 @@ cheers-verify = { path = "../../../cheers/crates/cheers-verify", version = "0.8.
 # transitive surface. (It was dev-only between R600-F3 and R594-F8.)
 reqwest = { version = "0.12", features = ["rustls-tls", "http2", "json"], default-features = false }
 
+[features]
+# R779: reverted to `default = []` on 2026-08-31 — `cargo publish --verify`
+# packages and builds the tarball standalone, so the workspace
+# `[patch.crates-io]` → yah-ai/pingora fork never applies there and the
+# default-on feature failed publish verification (does not compile against
+# crates.io pingora 0.8.1). Re-enable by default once the fork's hunks land
+# upstream and this crate can depend on stock pingora directly.
+default = []
+# Adopt an inherited listening socket (systemd LISTEN_FDS / kamaji's on-demand
+# JIT tier) instead of binding PASSWAY_LISTEN fresh. Needs
+# `Server::seed_listen_fd`, which crates.io pingora-core 0.8.1 does not have —
+# it lives in patches/pingora-0.8.1-seed-listen-fds.patch and on the yah-ai
+# pingora fork. Without the fork the feature does not compile, by design,
+# rather than silently binding fresh.
+socket-activation = []
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 pasetors = "0.7"
+# R779 `tests/jit_cold_start.rs` — the end-to-end proof that passway serves
+# from behind a supervisor that holds the listen socket. All three are already
+# in this workspace's graph, so they add no new transitive surface:
+#   rcgen        — already a direct dep of instant-acme (same `ring` backend);
+#                  mints the self-signed leaf the forked binary serves.
+#   libc         — the `dup2`/`fcntl` pair the `pre_exec` hook needs to put the
+#                  held socket on fd 3, mirroring kamaji's `jit.rs`.
+#   passway-demux — the real demux, driven in-process, so the test exercises the
+#                  actual SNI path rather than a stand-in for it.
+# (No `tempfile`: this crate deliberately hand-rolls its scratch dirs — see
+# `acme.rs`'s test `TempDir` — and the JIT test reuses that idiom.)
+rcgen = "0.14"
+libc = "0.2"
+# Versioned like every other path dep here: deny.toml sets `wildcards = "deny"`,
+# so a bare `path =` fails `cargo deny check bans`.
+passway-demux = { path = "../sni-demux", version = "0.8.29" }
+
+[[test]]
+name = "main"
+path = "tests/main.rs"

@@ -155,4 +155,9 @@ ignore = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# R779: the one carried git source — the pingora fork that adds
+# `Server::seed_listen_fd` (see patches/README.md). Pinned by full `rev` in the
+# workspace `[patch.crates-io]`, so this entry does not widen the supply chain
+# to "whatever that repo's main says". Remove this line and the patch block
+# together once the hunks land upstream in cloudflare/pingora.
+allow-git = ["https://github.com/yah-ai/pingora"]

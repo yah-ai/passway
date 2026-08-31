@@ -18,12 +18,16 @@
 //! | `PASSWAY_ACME_CHALLENGE` | `http-01` or `dns-01` (Cloudflare; required for wildcard domains) | `http-01` |
 //! | `PASSWAY_ACME_DNS01_CLOUDFLARE_TOKEN_FILE` | path to a file holding a CF API token with `DNS:Edit` on the zone | required if `dns-01` |
 //! | `PASSWAY_ACME_DNS01_CLOUDFLARE_ZONE_ID` | CF zone ID the `_acme-challenge` TXT records are created in | required if `dns-01` |
+//! | `PASSWAY_ACME_DNS01_DELEGATE_ZONE` | R779: publish the challenge TXT at `<domain>.<this zone>` instead of `_acme-challenge.<domain>` — for a domain whose zone we do not hold, whose owner CNAMEs `_acme-challenge.<domain>` here | unset (we hold the zone) |
 //! | `PASSWAY_ACME_DNS01_PROPAGATION_SECS` | wait between publishing a TXT record and asking the CA to validate | `10` |
 //! | `PASSWAY_ACME_ACCOUNT_CACHE` | path to cache ACME account credentials (JSON) | `<PASSWAY_TLS_CERT>.acme-account.json` |
 //! | `PASSWAY_ACME_HTTP01_BIND` | address the HTTP-01 challenge responder binds | `0.0.0.0:80` |
 //! | `PASSWAY_ACME_RENEW_BEFORE_DAYS` | renew when within this many days of expiry | `30` |
 //! | `PASSWAY_ACME_CHECK_INTERVAL_SECS` | how often the renewal loop wakes to check | `43200` (12h) |
 //! | `PASSWAY_ACME_CERT_LIFETIME_DAYS` | assumed cert validity (LE/ZeroSSL standard) | `90` |
+//! | `PASSWAY_ACME_BOOTSTRAP_TIMEOUT_SECS` | R779: cap on the first-boot issuance (certmagic's handshake budget); a timeout is recorded in the `<cert>.acme-failed` backoff marker | `180` |
+//! | `LISTEN_FDS` / `LISTEN_PID` | R779: systemd socket-activation convention — with `LISTEN_FDS=1` (and `LISTEN_PID` unset or equal to this pid) fd 3 is adopted as the `PASSWAY_LISTEN` socket instead of binding fresh; this is how the process sits behind kamaji's on-demand JIT tier | unset |
+//! | `PASSWAY_IDLE_TTL_SECS` | R779: exit once no request has been in flight for this long — for kamaji's on-demand JIT tier, which re-forks on the next connection. Unset = never | unset |
 //! | `PASSWAY_UPSTREAM_SOURCE` | `static` (from `PASSWAY_UPSTREAMS`) or `yubaba` (R594-F8 discovery) | `static` |
 //! | `PASSWAY_UPSTREAMS` | comma-separated backend list, optionally `<hostname>=` prefixed to give each fronted service its own set (`static` source only — see below) | empty (fail-ready 503) |
 //! | `PASSWAY_YUBABA_URL` | base URL of the yubaba to discover upstreams from, e.g. `http://100.64.0.2:7443` | required if `PASSWAY_UPSTREAM_SOURCE=yubaba` |
@@ -120,6 +124,7 @@ use pingora::services::background::background_service;
 use passway::acme::{self, AcmeConfig};
 use passway::auth::{CheersAuth, RouteAuthPolicy};
 use passway::discovery::{YubabaDiscoveryConfig, YubabaUpstreams};
+use passway::idle::{IdleReaper, IdleTracker};
 use passway::proxy::PassProxy;
 use passway::routing::{build_host_router, HostKey, CATCH_ALL_LABEL};
 use passway::tls::{build_tls_settings, TlsMode};
@@ -127,6 +132,32 @@ use passway::upstream::{StaticUpstreams, UpstreamSource};
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// The inherited listening socket under the systemd socket-activation
+/// convention (`LISTEN_FDS=1`, socket at fd 3), or `None` to bind fresh. If
+/// `LISTEN_PID` is set it must name this process — a grandchild must not
+/// adopt a socket meant for its parent. Same contract `mesofact-serve` and
+/// `passway-demux` speak, and the one kamaji's JIT tier provides (it sets
+/// `LISTEN_FDS=1` and deliberately no `LISTEN_PID`).
+#[cfg(unix)]
+fn socket_activation_fd() -> Option<std::os::unix::io::RawFd> {
+    let n_fds: i32 = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
+    if n_fds < 1 {
+        return None;
+    }
+    if let Ok(pid) = std::env::var("LISTEN_PID") {
+        if pid.parse::<u32>().ok() != Some(std::process::id()) {
+            return None;
+        }
+    }
+    const SD_LISTEN_FDS_START: std::os::unix::io::RawFd = 3;
+    Some(SD_LISTEN_FDS_START)
+}
+
+#[cfg(not(unix))]
+fn socket_activation_fd() -> Option<i32> {
+    None
 }
 
 fn env_secs(key: &str, default: u64) -> Duration {
@@ -327,9 +358,28 @@ fn main() {
             .enable_all()
             .build()
             .expect("failed to build the ACME bootstrap runtime");
-        bootstrap_rt
-            .block_on(acme::ensure_cert_on_disk(config))
-            .expect("initial ACME certificate issuance failed — check PASSWAY_ACME_* env vars and that port 80 is reachable from the public internet for HTTP-01 validation");
+        // R779: bound the bootstrap at certmagic's 180 s handshake budget.
+        // Under kamaji's JIT the first client is waiting in the kernel
+        // accept queue for this to finish; a timeout is recorded as a
+        // failure so the backoff marker stops a re-fork loop from
+        // re-ordering immediately (see acme.rs "Issuance failure backoff").
+        let bootstrap_timeout = env_secs("PASSWAY_ACME_BOOTSTRAP_TIMEOUT_SECS", 180);
+        let outcome = bootstrap_rt.block_on(async {
+            tokio::time::timeout(bootstrap_timeout, acme::ensure_cert_on_disk(config)).await
+        });
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!(
+                "initial ACME certificate issuance failed: {e} — check PASSWAY_ACME_* env vars and that port 80 is reachable from the public internet for HTTP-01 validation"
+            ),
+            Err(_elapsed) => {
+                acme::record_issuance_failure(config, std::time::SystemTime::now());
+                panic!(
+                    "initial ACME certificate issuance did not finish within {}s (PASSWAY_ACME_BOOTSTRAP_TIMEOUT_SECS)",
+                    bootstrap_timeout.as_secs()
+                );
+            }
+        }
     }
 
     let upstream_sources = build_upstream_sources();
@@ -346,6 +396,29 @@ fn main() {
     // actually reload a renewed ACME cert (this process never triggers
     // the upgrade itself).
     let mut conf = ServerConf::default();
+    // ONE worker thread per service, pinned deliberately (R777). This is
+    // pingora 0.8.1's own default (`ServerConf::default()` -> `threads: 1`,
+    // `pingora-core/src/server/configuration/mod.rs:137`), so today the line
+    // changes nothing — it is here because inheriting it is not safe enough.
+    //
+    // Two reasons it must be stated rather than inherited:
+    //
+    // 1. `Cargo.toml` requires `pingora = ">=0.8.1"`, an *unbounded* range. A
+    //    future release is free to change this default, and because the count
+    //    is per-service-per-process it would multiply across every passway on
+    //    the fleet at once, silently.
+    // 2. Per-tenant deployment (W267 §"One listener, one cert") makes the
+    //    per-process footprint a per-tenant cost. Measured 2026-08-15 on the
+    //    live fleet: 9.8 MB RSS on us-south-001 (1 core, 961 MB box) and
+    //    13.2 MB on us-east-001 (6 cores) — flat across core count precisely
+    //    BECAUSE this is 1 and not `nproc`. That flatness is the property
+    //    that makes one-process-per-tenant affordable.
+    //
+    // Raising it is a legitimate throughput decision, not a forbidden one —
+    // but it is an N-tenants-wide decision, so make it on purpose and
+    // re-measure. pingora's work-stealing runtime means 1 thread is not 1
+    // connection at a time.
+    conf.threads = 1;
     conf.pid_file = env_or("PASSWAY_PID_FILE", &conf.pid_file);
     conf.upgrade_sock = env_or("PASSWAY_UPGRADE_SOCK", &conf.upgrade_sock);
     let opt = Opt {
@@ -353,6 +426,25 @@ fn main() {
         ..Default::default()
     };
     let mut server = Server::new_with_opt_and_conf(Some(opt), conf);
+    // R779: socket activation. When a supervisor (kamaji's on-demand JIT
+    // tier, or a systemd .socket unit) hands us an already-listening socket
+    // as fd 3 under the LISTEN_FDS convention, seed it for the TLS listener
+    // so pingora accepts on it instead of binding `PASSWAY_LISTEN` fresh.
+    // The bind string must match exactly — that is the key pingora looks up.
+    if let Some(fd) = socket_activation_fd() {
+        #[cfg(feature = "socket-activation")]
+        {
+            log::info!("passway: adopting inherited LISTEN_FDS socket (fd {fd}) for {listen}");
+            server.seed_listen_fd(listen.as_str(), fd);
+        }
+        // Fail loudly rather than bind fresh: a supervisor that handed us a
+        // socket expects us to accept on it, and a second listener on the
+        // same address would either EADDRINUSE or silently split traffic.
+        #[cfg(not(feature = "socket-activation"))]
+        panic!(
+            "LISTEN_FDS is set (fd {fd}) but this passway was built without the `socket-activation` feature — see crates/passway/Cargo.toml [features]"
+        );
+    }
     server.bootstrap();
 
     // One health-checked, round-robin load balancer per fronted hostname
@@ -367,6 +459,20 @@ fn main() {
     }
     proxy = proxy.with_health_path(env_or("PASSWAY_HEALTH_PATH", "/health"));
 
+    // R779: idle self-reap for the kamaji JIT tier. Unset = never exit on
+    // idle (a standalone passway must stay up).
+    let mut idle_reaper = None;
+    if let Ok(v) = std::env::var("PASSWAY_IDLE_TTL_SECS") {
+        let ttl = Duration::from_secs(
+            v.parse()
+                .expect("PASSWAY_IDLE_TTL_SECS must be an integer number of seconds"),
+        );
+        let tracker = Arc::new(IdleTracker::new());
+        proxy = proxy.with_idle_tracker(tracker.clone());
+        idle_reaper = Some(background_service("passway idle reaper", IdleReaper::new(tracker, ttl)));
+        log::info!("passway idle self-reap armed: exit after {}s with no requests in flight", ttl.as_secs());
+    }
+
     let mut proxy_service = pingora::proxy::http_proxy_service(&server.configuration, proxy);
     let tls_settings = build_tls_settings(&tls_mode)
         .expect("failed to build TLS settings — check PASSWAY_TLS_CERT / PASSWAY_TLS_KEY");
@@ -375,6 +481,9 @@ fn main() {
     server.add_service(proxy_service);
     for lb_service in lb_services {
         server.add_service(lb_service);
+    }
+    if let Some(reaper) = idle_reaper {
+        server.add_service(reaper);
     }
     if let Some(config) = acme_config {
         let acme_service = background_service("passway acme renewal", acme::AcmeRenewalService::new(config));

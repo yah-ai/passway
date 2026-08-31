@@ -18,10 +18,10 @@
 //!      fail-ready-503s rather than routing into a black hole.
 //!
 //! ```bash
-//! cargo test --test yubaba_discovery
+//! cargo test --test main yubaba_discovery::
 //! ```
 
-mod common;
+use crate::common;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

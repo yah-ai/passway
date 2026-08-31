@@ -25,6 +25,13 @@
 //! verdict forbids. Routing is on the HTTP authority alone; the checks below
 //! are what stands in for it.
 //!
+//! R777 (2026-08-15) re-weighed exactly that backend switch and kept the
+//! verdict, so this paragraph stands. The reasoning moved on, though: the
+//! cross-check is worth most on a front door serving *several tenants*, and
+//! R777 settled that a second tenant gets its own passway process rather than
+//! a second cert here — which shrinks what this defence would buy. See
+//! [`crate::tls`]'s "One listener serves one cert" section and W267.
+//!
 //! ## Fail closed on an ambiguous authority
 //!
 //! Same posture as [`crate::hardening`]: a request that names *two different*

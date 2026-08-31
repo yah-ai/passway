@@ -4,7 +4,7 @@
 //! Also proves the anonymous-by-default posture: an unlisted route is
 //! reachable with no bearer at all.
 
-mod common;
+use crate::common;
 
 use cheers_core::{PrincipalId, Scope};
 use cheers_verify::PasetoV4PublicVerifier;

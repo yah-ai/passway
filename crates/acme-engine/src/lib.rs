@@ -127,7 +127,42 @@ pub enum AcmeChallengeKind {
         /// created in. Explicit (not looked up by name) so the token can
         /// be scoped without `Zone:Read`.
         zone_id: String,
+        /// R779 — **challenge delegation**, for identifiers whose zone we do
+        /// not hold.
+        ///
+        /// `None` is the ordinary case: the TXT lands at
+        /// `_acme-challenge.<identifier>`, which only works when `zone_id` is
+        /// the identifier's own zone.
+        ///
+        /// `Some("acme.example.net")` publishes at
+        /// `<identifier>.acme.example.net` instead, inside a zone we *do*
+        /// hold. The identifier's owner points
+        /// `_acme-challenge.<identifier>` at that name with a CNAME, and the
+        /// CA follows it — RFC 8555 validates by resolving the TXT, and
+        /// resolution follows CNAMEs like any other lookup. This is how a
+        /// custom tenant domain is issued without either holding its zone or
+        /// standing up an `:80` tier. See [`dns01_record_name`].
+        delegate_zone: Option<String>,
     },
+}
+
+/// Where the DNS-01 TXT record for `base` is published.
+///
+/// Split out and public because it is the whole of the delegation contract:
+/// whatever this returns is exactly what a tenant must CNAME
+/// `_acme-challenge.<their domain>` to, so an onboarding page and the issuer
+/// have to agree on it byte for byte, and a test has to be able to pin it.
+///
+/// `base` is the *identifier* from the authorization, not the SAN — a wildcard
+/// authorization for `*.example.com` carries `example.com`, and validates at the
+/// same record name as the apex.
+pub fn dns01_record_name(base: &str, delegate_zone: Option<&str>) -> String {
+    match delegate_zone {
+        // Trailing/leading dots trimmed: an operator writing a fully-qualified
+        // `acme.example.net.` should not produce a `..` in the middle of a name.
+        Some(zone) => format!("{}.{}", base.trim_matches('.'), zone.trim_matches('.')),
+        None => format!("_acme-challenge.{base}"),
+    }
 }
 
 /// The provider-agnostic input to [`issue`]: everything the RFC-8555 dance
@@ -281,6 +316,16 @@ struct CreatedTxtRecord {
     name: String,
 }
 
+/// Everything the DNS-01 arm of [`issue`] needs, resolved once before the first
+/// authorization. A struct rather than a tuple because it grew a fourth member
+/// (`delegate_zone`) and three call sites destructure it.
+struct Dns01Ctx {
+    client: reqwest::Client,
+    token: String,
+    zone_id: String,
+    delegate_zone: Option<String>,
+}
+
 /// Create a `_acme-challenge` TXT record. Deliberately a bare create, not
 /// an upsert: a wildcard + apex order produces two authorizations for the
 /// *same* record name (`_acme-challenge.example.com`) whose TXT values must
@@ -407,14 +452,23 @@ pub async fn issue(config: &IssueConfig, tokens: &ChallengeTokens) -> Result<Iss
     // root-readable file, not the environment — see [`AcmeChallengeKind`].
     let dns01 = match &config.challenge {
         AcmeChallengeKind::Http01 => None,
-        AcmeChallengeKind::Dns01Cloudflare { token_file, zone_id } => {
+        AcmeChallengeKind::Dns01Cloudflare {
+            token_file,
+            zone_id,
+            delegate_zone,
+        } => {
             let token = std::fs::read_to_string(token_file)
                 .map_err(|e| {
                     AcmeError::Config(format!("reading Cloudflare token file {token_file:?}: {e}"))
                 })?
                 .trim()
                 .to_string();
-            Some((reqwest::Client::new(), token, zone_id.clone()))
+            Some(Dns01Ctx {
+                client: reqwest::Client::new(),
+                token,
+                zone_id: zone_id.clone(),
+                delegate_zone: delegate_zone.clone(),
+            })
         }
     };
 
@@ -445,7 +499,7 @@ pub async fn issue(config: &IssueConfig, tokens: &ChallengeTokens) -> Result<Iss
                     challenge.set_ready().await?;
                 }
             }
-            Some((client, token, zone_id)) => {
+            Some(ctx) => {
                 // Two passes, deliberately: publish EVERY record first,
                 // then trigger validations. A wildcard + apex order has
                 // two authorizations validating at the *same* record name
@@ -485,9 +539,15 @@ pub async fn issue(config: &IssueConfig, tokens: &ChallengeTokens) -> Result<Iss
                             )))
                         }
                     };
-                    let name = format!("_acme-challenge.{base}");
-                    let record_id =
-                        cloudflare_create_txt(client, token, zone_id, &name, &txt_value).await?;
+                    let name = dns01_record_name(&base, ctx.delegate_zone.as_deref());
+                    let record_id = cloudflare_create_txt(
+                        &ctx.client,
+                        &ctx.token,
+                        &ctx.zone_id,
+                        &name,
+                        &txt_value,
+                    )
+                    .await?;
                     log::info!("acme-engine: published TXT {name} for DNS-01 validation");
                     created_records.push(CreatedTxtRecord { record_id, name });
                 }
@@ -535,9 +595,12 @@ pub async fn issue(config: &IssueConfig, tokens: &ChallengeTokens) -> Result<Iss
             guard.remove(token);
         }
     }
-    if let Some((client, token, zone_id)) = &dns01 {
+    if let Some(ctx) = &dns01 {
         for record in &created_records {
-            if let Err(e) = cloudflare_delete_record(client, token, zone_id, &record.record_id).await {
+            if let Err(e) =
+                cloudflare_delete_record(&ctx.client, &ctx.token, &ctx.zone_id, &record.record_id)
+                    .await
+            {
                 log::warn!(
                     "acme-engine: failed to clean up TXT {} (record {}) — it has a 60s TTL and \
                      can be deleted manually: {e}",
@@ -691,5 +754,46 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         TempDir(dir)
+    }
+
+    // ── R779 DNS-01 delegation ───────────────────────────────────────────────
+
+    #[test]
+    fn undelegated_dns01_publishes_at_the_identifiers_own_challenge_name() {
+        assert_eq!(
+            dns01_record_name("example.com", None),
+            "_acme-challenge.example.com"
+        );
+    }
+
+    #[test]
+    fn delegated_dns01_publishes_inside_the_zone_we_hold() {
+        // The tenant's zone is not ours, so nothing may be written under
+        // `shop.tenant.io`; the record goes in `acme.yah.dev`, which is.
+        assert_eq!(
+            dns01_record_name("shop.tenant.io", Some("acme.yah.dev")),
+            "shop.tenant.io.acme.yah.dev"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_and_its_apex_delegate_to_one_name() {
+        // instant-acme hands both authorizations the *base* identifier, so this
+        // is the delegation equivalent of the shared `_acme-challenge.<base>`
+        // the two-pass publish exists to handle — one name, two TXT values.
+        let base = "example.com";
+        assert_eq!(
+            dns01_record_name(base, Some("acme.yah.dev")),
+            dns01_record_name(base, Some("acme.yah.dev"))
+        );
+    }
+
+    #[test]
+    fn fully_qualified_zone_and_identifier_do_not_produce_a_double_dot() {
+        // An operator copying a zone out of a DNS UI often brings the root dot.
+        assert_eq!(
+            dns01_record_name("shop.tenant.io.", Some("acme.yah.dev.")),
+            "shop.tenant.io.acme.yah.dev"
+        );
     }
 }

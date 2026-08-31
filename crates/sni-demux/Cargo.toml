@@ -1,0 +1,37 @@
+[package]
+# R779: the SNI demultiplexer — one hot process on :443 that peeks each
+# ClientHello, reads the server_name extension, and splices the raw TCP
+# stream to the per-tenant passway that owns that hostname WITHOUT
+# terminating TLS. Published under the passway- prefix like passway-acme
+# (R635); `[lib] name` keeps the module name short.
+name = "passway-demux"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SNI demultiplexer for passway (W267 / R779): peeks the TLS ClientHello, reads the server_name, and splices the raw TCP stream to a per-hostname backend without terminating TLS — holds no private key, sees no plaintext."
+keywords = ["sni", "tls", "proxy", "ingress", "passthrough"]
+categories = ["network-programming"]
+
+[lib]
+name = "sni_demux"
+
+[[bin]]
+name = "passway-demux"
+path = "src/main.rs"
+
+# TRUST-BOUNDARY crate (same posture as passway): a public listener parsing
+# untrusted bytes. Deliberately dependency-light — the ClientHello parser is
+# hand-written over `&[u8]` (no TLS library is linked at all: this process
+# must never be able to terminate TLS, and the cheapest way to guarantee
+# that is to not link anything that could), and the splice is
+# `tokio::io::copy_bidirectional`.
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync"] }
+log = "0.4"
+env_logger = "0.11"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"

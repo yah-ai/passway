@@ -5,7 +5,7 @@
 //! is control over the `Host` header — including sending two of them, which
 //! no well-behaved client library will do.
 
-mod common;
+use crate::common;
 
 use std::net::SocketAddr;
 use std::time::Duration;

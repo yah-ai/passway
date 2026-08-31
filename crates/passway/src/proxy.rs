@@ -46,6 +46,7 @@ use crate::auth::{self, CheersAuth, RouteAuthPolicy};
 use crate::hardening;
 use crate::health::{HostReadiness, ReadinessBody};
 use crate::host::{self, HostOutcome};
+use crate::idle::IdleTracker;
 use crate::routing::HostRouter;
 use crate::upstream;
 
@@ -73,6 +74,8 @@ pub struct PassProxy {
     upstream_sni: String,
     health_path: String,
     draining: Arc<AtomicBool>,
+    /// R779: in-flight counter for idle self-reap. `None` = never reap.
+    idle: Option<Arc<IdleTracker>>,
 }
 
 impl PassProxy {
@@ -94,7 +97,17 @@ impl PassProxy {
             upstream_sni: String::new(),
             health_path: "/health".to_string(),
             draining: Arc::new(AtomicBool::new(false)),
+            idle: None,
         }
+    }
+
+    /// R779: count requests into `tracker` so an [`crate::idle::IdleReaper`]
+    /// can exit the process once it has been idle for its TTL. Only
+    /// meaningful behind a supervisor that re-arms on exit (kamaji's JIT
+    /// tier); a standalone passway should leave this unset.
+    pub fn with_idle_tracker(mut self, tracker: Arc<IdleTracker>) -> Self {
+        self.idle = Some(tracker);
+        self
     }
 
     /// Wire cheers-verify edge auth plus the per-route policy deciding
@@ -171,7 +184,19 @@ impl ProxyHttp for PassProxy {
         RequestCtx::default()
     }
 
+    /// Always called by pingora at the end of every request, including ones
+    /// `request_filter` rejected — which is what keeps the R779 idle count
+    /// balanced with the `begin()` at the top of `request_filter`.
+    async fn logging(&self, _session: &mut Session, _e: Option<&Error>, _ctx: &mut Self::CTX) {
+        if let Some(idle) = &self.idle {
+            idle.end();
+        }
+    }
+
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> PResult<bool> {
+        if let Some(idle) = &self.idle {
+            idle.begin();
+        }
         // Pull everything the filter decides on out of the (immutable)
         // request header up front as owned values, so the rest of the method
         // can mutably borrow the session to write responses.

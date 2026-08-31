@@ -10,11 +10,22 @@
 # reserve-crate-names.sh or `cargo publish` here; that is the operator's
 # move, not this ticket's.
 [workspace]
-members = ["crates/passway", "crates/acme-engine"]
+members = ["crates/passway", "crates/acme-engine", "crates/sni-demux"]
 resolver = "2"
 
+# R779 — carried pingora fork. `Server::seed_listen_fd(bind, fd)` lets passway
+# adopt an already-listening socket handed in as fd 3 (systemd LISTEN_FDS /
+# kamaji's on-demand JIT tier); crates.io pingora 0.8.1 has no such API and its
+# only fd-inheritance path is its own SCM_RIGHTS upgrade protocol. The fork is
+# tag 0.8.1 + patches/pingora-0.8.1-seed-listen-fds.patch and is a WAITING ROOM:
+# drop this block once the same three hunks land upstream in cloudflare/pingora.
+#
+# ALL 14 pingora crates in the graph must be patched, not just pingora-core —
+# patching one duplicates pingora-error / pingora-http (registry vs fork) and
+# the types stop unifying (E0308 everywhere). Pinned by `rev`, never `branch`:
+# a moving branch in a [patch] block makes the build non-reproducible.
 [workspace.package]
-version = "0.8.22"
+version = "0.8.29"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"

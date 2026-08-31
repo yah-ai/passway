@@ -8,7 +8,7 @@
 //! client-side (collapsing `//`, `/../`, etc.) before it would ever reach
 //! the proxy — the exact normalization gap the fix closes.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

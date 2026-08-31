@@ -1,0 +1,118 @@
+diff -ruN a/pingora-core/src/listeners/l4.rs b/pingora-core/src/listeners/l4.rs
+--- a/pingora-core/src/listeners/l4.rs	2026-08-28 14:36:49
++++ b/pingora-core/src/listeners/l4.rs	2026-08-28 14:43:24
+@@ -209,6 +209,15 @@
+             let std_listener_socket = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+             #[cfg(windows)]
+             let std_listener_socket = unsafe { std::net::TcpStream::from_raw_socket(fd as u64) };
++            // An fd handed over the upgrade socket came from a tokio listener
++            // and is already non-blocking; one seeded from a socket-activation
++            // supervisor (systemd, or anything that bound it with the std
++            // library) is blocking, and tokio's `TcpListener::from_std` does
++            // not change that — a blocking accept would then stall a worker.
++            // Setting it here is idempotent for the upgrade case.
++            std_listener_socket
++                .set_nonblocking(true)
++                .or_err_with(BindError, || format!("set_nonblocking failed on {address:?}"))?;
+             let listener_socket = TcpSocket::from_std_stream(std_listener_socket);
+             // Note that we call listen on an already listening socket
+             // POSIX undefined but on Linux it will update the backlog size
+diff -ruN a/pingora-core/src/server/bootstrap_services.rs b/pingora-core/src/server/bootstrap_services.rs
+--- a/pingora-core/src/server/bootstrap_services.rs	2026-08-28 14:36:49
++++ b/pingora-core/src/server/bootstrap_services.rs	2026-08-28 14:37:21
+@@ -17,6 +17,8 @@
+ use async_trait::async_trait;
+ use log::{debug, error, info};
+ use parking_lot::Mutex;
++#[cfg(unix)]
++use std::os::unix::io::RawFd;
+ use std::sync::Arc;
+ use tokio::sync::{broadcast, Mutex as TokioMutex};
+ 
+@@ -75,6 +77,15 @@
+     #[cfg(unix)]
+     listen_fds: Option<ListenFds>,
+ 
++    /// Listening sockets handed to this process by something other than a
++    /// pingora sibling — e.g. a systemd `.socket` unit or any supervisor
++    /// speaking the `LISTEN_FDS` socket-activation convention. Seeded via
++    /// [`Bootstrap::seed_fd`] before [`Bootstrap::bootstrap`] runs and
++    /// merged into `listen_fds` there, so a listener whose bind address
++    /// matches adopts the inherited socket instead of binding fresh.
++    #[cfg(unix)]
++    seeded_fds: Option<Fds>,
++
+     #[cfg(feature = "sentry")]
+     #[cfg_attr(docsrs, doc(cfg(feature = "sentry")))]
+     /// The Sentry ClientOptions.
+@@ -103,6 +114,8 @@
+             upgrade_sock,
+             #[cfg(unix)]
+             listen_fds: None,
++            #[cfg(unix)]
++            seeded_fds: None,
+             execution_phase_watch: execution_phase_watch.clone(),
+             completed: false,
+             #[cfg(feature = "sentry")]
+@@ -166,9 +179,26 @@
+             .ok();
+     }
+ 
++    /// Register an already-listening socket for the listener bound to `bind`
++    /// (the exact address string later passed to `add_tcp` /
++    /// `add_tls_with_settings`, e.g. `"0.0.0.0:443"`). Must be called before
++    /// [`Bootstrap::bootstrap`]; the process takes ownership of `fd`.
++    ///
++    /// This is the socket-activation counterpart of the upgrade-socket path:
++    /// the latter receives fds from a previous pingora process over
++    /// `SCM_RIGHTS`, this one accepts fds from whoever spawned the process
++    /// (systemd, or a supervisor holding the socket across restarts). Seeded
++    /// fds are merged with any received over the upgrade socket; an fd
++    /// received for the same bind wins, since it comes from the process
++    /// currently serving that address.
+     #[cfg(unix)]
++    pub fn seed_fd(&mut self, bind: String, fd: RawFd) {
++        self.seeded_fds.get_or_insert_with(Fds::new).add(bind, fd);
++    }
++
++    #[cfg(unix)]
+     fn load_fds(&mut self, upgrade: bool) -> Result<(), nix::Error> {
+-        let mut fds = Fds::new();
++        let mut fds = self.seeded_fds.take().unwrap_or_else(Fds::new);
+         if upgrade {
+             debug!("Trying to receive socks");
+             fds.get_from_sock(self.upgrade_sock.as_str())?
+diff -ruN a/pingora-core/src/server/mod.rs b/pingora-core/src/server/mod.rs
+--- a/pingora-core/src/server/mod.rs	2026-08-28 14:36:49
++++ b/pingora-core/src/server/mod.rs	2026-08-28 14:38:15
+@@ -368,6 +368,30 @@
+         self.bootstrap.lock().get_fds()
+     }
+ 
++    /// Adopt an already-listening socket for the listener that will be added
++    /// with bind address `bind` (the exact string later passed to
++    /// `add_tcp` / `add_tls_with_settings`, e.g. `"0.0.0.0:443"`). Call before
++    /// [`Self::bootstrap`]. The server takes ownership of `fd`.
++    ///
++    /// This is how a pingora server runs under systemd socket activation or
++    /// any supervisor that holds the listening socket across restarts and
++    /// passes it as an inherited fd (`LISTEN_FDS`): the caller reads the
++    /// inherited fd number and seeds it here, and the matching listener then
++    /// accepts on it instead of binding a fresh socket. Fds received over the
++    /// upgrade socket (`Opt::upgrade`) take precedence for the same bind.
++    ///
++    /// ```ignore
++    /// // systemd passes the first socket as fd 3 with LISTEN_FDS=1.
++    /// if std::env::var("LISTEN_FDS").ok().as_deref() == Some("1") {
++    ///     server.seed_listen_fd("0.0.0.0:443", 3);
++    /// }
++    /// server.bootstrap();
++    /// ```
++    #[cfg(unix)]
++    pub fn seed_listen_fd(&mut self, bind: impl Into<String>, fd: std::os::unix::io::RawFd) {
++        self.bootstrap.lock().seed_fd(bind.into(), fd);
++    }
++
+     #[allow(clippy::too_many_arguments)]
+     fn run_service(
+         mut service: Box<dyn ServiceWithDependents>,

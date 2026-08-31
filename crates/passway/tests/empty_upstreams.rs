@@ -2,7 +2,7 @@
 //! crashes (R594-F4 V0 MUST #6 / R594-F6 cold-start gotcha; VERIFY list
 //! item 2).
 
-mod common;
+use crate::common;
 
 #[tokio::test]
 async fn empty_upstreams_returns_503_and_health_reports_unready() {

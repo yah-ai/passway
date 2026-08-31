@@ -1,7 +1,7 @@
 //! Integration test: passway round-robins over 2 fake upstreams
 //! (R594-F4 V0 MUST #1 + VERIFY list item 1).
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 
@@ -40,17 +40,23 @@ async fn round_robins_over_two_upstreams() {
         tags.push(tag);
     }
 
+    // Strict alternation, phase-agnostic: which upstream serves the FIRST
+    // request is not a round-robin property — pingora's LoadBalancer holds
+    // backends in an address-ordered set, and these upstreams sit on
+    // OS-assigned ephemeral ports, so "a before b" is a coin flip decided by
+    // the port allocator. Asserting a fixed starting upstream made this test
+    // flaky the moment anything else on the machine (or in this process)
+    // interleaved port allocation. R743-T6 audit finding.
+    for pair in tags.windows(2) {
+        assert_ne!(
+            pair[0], pair[1],
+            "expected strict alternation over 2 upstreams, got {tags:?}"
+        );
+    }
     assert_eq!(
-        tags,
-        vec![
-            "upstream-a",
-            "upstream-b",
-            "upstream-a",
-            "upstream-b",
-            "upstream-a",
-            "upstream-b",
-        ],
-        "expected strict alternation over 2 upstreams, got {tags:?}"
+        tags.iter().filter(|t| *t == "upstream-a").count(),
+        3,
+        "expected an even 3/3 split over 2 upstreams, got {tags:?}"
     );
 }
 
