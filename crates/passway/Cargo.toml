@@ -58,7 +58,7 @@ env_logger = "0.11"
 # R635: published as `passway-acme` (the `acme-engine` name on crates.io is an
 # unrelated crate). The alias keeps `use acme_engine::…` in this crate's source
 # unchanged; the `version` req is what crates.io requires of a path dep.
-acme-engine = { package = "passway-acme", path = "../acme-engine", version = "0.8.29" }
+acme-engine = { package = "passway-acme", path = "../acme-engine", version = "0.8.30" }
 
 # cheers-verify edge auth (R594-F4 V0 MUST #3): PasetoV4PublicVerifier +
 # McpClaims, path+version dep into the co-developed oss/cheers workspace —
@@ -66,8 +66,8 @@ acme-engine = { package = "passway-acme", path = "../acme-engine", version = "0.
 # in-tree consumer of cheers-verify outside the cheers workspace itself)
 # already uses. cheers-verify holds no minter (edge-safe by construction),
 # so a compromised passway process cannot forge a session.
-cheers-core = { path = "../../../cheers/crates/cheers-core", version = "0.8.29" }
-cheers-verify = { path = "../../../cheers/crates/cheers-verify", version = "0.8.29" }
+cheers-core = { path = "../../../cheers/crates/cheers-core", version = "0.8.30" }
+cheers-verify = { path = "../../../cheers/crates/cheers-verify", version = "0.8.30" }
 
 # HTTP client, two uses: `discovery.rs`'s poll of yubaba's service-record
 # surface (R594-F8) and the integration tests, which drive the running proxy
@@ -111,7 +111,7 @@ rcgen = "0.14"
 libc = "0.2"
 # Versioned like every other path dep here: deny.toml sets `wildcards = "deny"`,
 # so a bare `path =` fails `cargo deny check bans`.
-passway-demux = { path = "../sni-demux", version = "0.8.29" }
+passway-demux = { path = "../sni-demux", version = "0.8.30" }
 
 [[test]]
 name = "main"
