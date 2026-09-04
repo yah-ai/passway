@@ -30,6 +30,16 @@
 //! ```text
 //! PASSWAY_DEMUX_ROUTES='*.yah.dev=127.0.0.1:8443,yah.dev=127.0.0.1:8443,tenant.example=127.0.0.1:8444'
 //! ```
+//!
+//! @yah:ticket(R853-T2, "Put passway-demux on :443 in front of the live passways on us-east-001 and us-south-001")
+//! @yah:at(2026-09-03T06:34:07Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R853)
+//! @yah:blocked_on(operator)
+//! @yah:next("R779 step 3b, operator-SEQUENCED because these two nodes are live yah.dev origins and the change moves what answers :443. Per node: re-point PASSWAY_LISTEN to a loopback port, run passway-demux on :443 with a route per tenant, verify with `openssl s_client -servername <host>` against each. Routes can now come from PASSWAY_DEMUX_ROUTES_FILE plus the yubaba publisher (yubaba::demux_routes sweeps the enrollment set and rewrites the file tmp-plus-rename; PASSWAY_DEMUX_RELOAD_SECS default 10) instead of the static PASSWAY_DEMUX_ROUTES env var — the file path is the better shape for more than a couple of tenants. Node config lives in .yah/infra/machines/.")
+//! @yah:gotcha("THREE LAYERS DELIBERATELY REFUSE AN EMPTY ROUTE TABLE — the publisher will not write one, the loader will not start on one, the watcher will not swap to one. A successful listing of an empty bucket and a bucket pointed at the wrong prefix are the same answer, and one of them de-routes every tenant at once. The cost you will meet in practice: unenrolling the LAST domain needs a demux restart. That is the right way round; do not \"fix\" it. One level down the trade flips — a malformed enrolled/ object is skipped with a warning, because one corrupt key should cost one tenant's route rather than everyone's.")
+//! @yah:gotcha("The demux links NO TLS library, holds no key and sees no plaintext — that is the load-bearing R777 invariant that keeps a cross-tenant RCE contained at 10k domains, and it is why routes arrive as a FILE rather than a bucket API call in either direction: a bucket client on the shared public :443 would hand a compromise of it both the whole fleet's routing and the credential to change it. Do not add one while wiring this up.")
 
 use std::path::PathBuf;
 use std::sync::Arc;

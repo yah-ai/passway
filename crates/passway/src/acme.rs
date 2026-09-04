@@ -204,6 +204,12 @@ pub fn parse_acme_config(
             delegate_zone: get("PASSWAY_ACME_DNS01_DELEGATE_ZONE")
                 .map(|z| z.trim().to_string())
                 .filter(|z| !z.is_empty()),
+            // R779-P8: unset is production (the real Cloudflare API). Only a
+            // Cloudflare-shaped stand-in — the DNS-01 integration harness —
+            // has any reason to set it.
+            api_base: get("PASSWAY_ACME_CF_API_BASE")
+                .map(|b| b.trim().to_string())
+                .filter(|b| !b.is_empty()),
         },
         other => {
             return Err(format!(
@@ -403,6 +409,9 @@ impl AcmeConfig {
             account_cache_path: self.account_cache_path.clone(),
             challenge: self.challenge.clone(),
             dns01_propagation_delay: self.dns01_propagation_delay,
+            // Public roots only. A private/test directory is an integration
+            // -harness concern, not something passway's env surface exposes.
+            directory_root_cert: None,
         }
     }
 }
@@ -915,6 +924,7 @@ mod tests {
                 token_file: "/etc/cf-token".to_string(),
                 zone_id: "zone123".to_string(),
                 delegate_zone: None,
+                api_base: None,
             }
         );
     }
@@ -938,6 +948,7 @@ mod tests {
                 token_file: "/etc/cf-token".to_string(),
                 zone_id: "zone123".to_string(),
                 delegate_zone: Some("acme.yah.dev".to_string()),
+                api_base: None,
             },
             "the delegate zone is trimmed and carried through to the engine"
         );

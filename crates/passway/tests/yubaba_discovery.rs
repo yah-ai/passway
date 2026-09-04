@@ -16,6 +16,8 @@
 //!      must not drain healthy backends.
 //!   3. An *authoritative* empty answer does drain them, and passway
 //!      fail-ready-503s rather than routing into a black hole.
+//!   4. Only the fronted workload's records become backends — a sibling
+//!      workload on the same node does not (R844-B6).
 //!
 //! ```bash
 //! cargo test --test main yubaba_discovery::
@@ -89,6 +91,24 @@ fn ready_body(upstream: SocketAddr) -> String {
     )
 }
 
+/// Two ready records of *different* idents, as a node hosting several
+/// workloads really answers. `marketing` is the one this proxy fronts.
+fn two_idents_body(marketing: SocketAddr, revalidate: SocketAddr) -> String {
+    format!(
+        r#"{{"version":1,"records":[
+            {{"ident":"marketing","mesh_ip":"{}","ports":[{}],"endpoints":["{marketing}"],
+             "container_id":"c-marketing","health":"ready","observed_at_unix_ms":1}},
+            {{"ident":"marketing-revalidate","mesh_ip":"{}","ports":[{}],
+             "endpoints":["{revalidate}"],"container_id":"c-revalidate","health":"ready",
+             "observed_at_unix_ms":1}}
+        ]}}"#,
+        marketing.ip(),
+        marketing.port(),
+        revalidate.ip(),
+        revalidate.port()
+    )
+}
+
 fn empty_body() -> String {
     r#"{"version":1,"records":[]}"#.to_string()
 }
@@ -114,6 +134,7 @@ async fn wait_for_ready(client: &reqwest::Client, base: &str, want_ready: u64) {
 fn discovery_source(yubaba: SocketAddr) -> Arc<YubabaUpstreams> {
     Arc::new(YubabaUpstreams::new(&YubabaDiscoveryConfig {
         base_url: format!("http://{yubaba}"),
+        ident: "marketing".to_string(),
         timeout: Duration::from_secs(2),
     }))
 }
@@ -141,6 +162,59 @@ async fn a_yubaba_published_record_becomes_a_routable_upstream() {
         "marketing",
         "traffic must reach the backend passway discovered, not a configured one"
     );
+}
+
+/// R844-B6. The discovery endpoint answers for the whole node, and a node
+/// routinely hosts siblings of the workload being fronted (yah-marketing next
+/// to yah-marketing-revalidate). Both are Ready; only one is ours. Without a
+/// client-side ident filter passway adopts both, and half of `marketing.yah.dev`
+/// lands in the revalidate container.
+#[tokio::test]
+async fn a_sibling_workloads_record_on_the_same_node_is_not_adopted() {
+    let marketing = common::spawn_fake_upstream("marketing").await;
+    let revalidate = common::spawn_fake_upstream("revalidate").await;
+    let answer: Answer = Arc::new(Mutex::new((200, two_idents_body(marketing, revalidate))));
+    let yubaba = spawn_fake_yubaba(Arc::clone(&answer)).await;
+
+    let (proxy, lb_background) = common::build_proxy_with_source(discovery_source(yubaba));
+    let listen = common::free_addr();
+    common::start_proxy(proxy, lb_background, listen);
+
+    let client = reqwest::Client::new();
+    let base = format!("http://{listen}");
+
+    // The count is the assertion. Under the pre-R844-B6 code this settles at
+    // 2 and never at 1, so `wait_for_ready(.., 1)` fails — while any
+    // "non-empty" assertion would have passed, which is exactly why the
+    // defect shipped.
+    wait_for_ready(&client, &base, 1).await;
+
+    // And it stays 1 across further discovery ticks (100ms each).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let health = client
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .expect("health request")
+        .json::<serde_json::Value>()
+        .await
+        .expect("health body");
+    assert_eq!(
+        health["ready_upstreams"].as_u64(),
+        Some(1),
+        "exactly one backend — the sibling's record must never be adopted: {health}"
+    );
+
+    // Round-robin over an over-wide set would land some of these on the
+    // sibling; every one must reach the workload this proxy fronts.
+    for _ in 0..6 {
+        let resp = client.get(format!("{base}/")).send().await.expect("request to proxy");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("x-upstream-tag").unwrap().to_str().unwrap(),
+            "marketing"
+        );
+    }
 }
 
 /// The load-bearing failure mode. yubaba going down is a control-plane

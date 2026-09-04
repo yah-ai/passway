@@ -91,6 +91,7 @@ pub mod host;
 pub mod idle;
 pub mod path;
 pub mod proxy;
+pub mod redirect;
 pub mod routing;
 pub mod tls;
 pub mod upstream;

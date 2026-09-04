@@ -44,6 +44,24 @@
 //!   Cloudflare API. Required for wildcards; also the only challenge a
 //!   standby node (not holding the public identity) can renew with, since
 //!   validation never touches the node.
+//!
+//! @yah:ticket(R853-T3, "Settle the Let's Encrypt order budget for the 10k fill: file the rate-limit adjustment request")
+//! @yah:at(2026-09-03T06:34:32Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R853)
+//! @yah:blocked_on(operator)
+//! @yah:next("R779 Decision 3, the procurement half. The binding limit is per-ACCOUNT new orders: 300 / 3h, i.e. 2400/day, which fills 10k domains in ~4.2 days without asking anyone. The plan of record is to QUEUE under the cap and file Let's Encrypt's rate-limit adjustment form once projected volume approaches ~2k/day. That filing is the operator action here. (Do NOT inherit W273's duplicate-certificate number — that limit is per identical SAN set and does not bind on 10k distinct registered domains.)")
+//! @yah:next("ALREADY ENFORCED IN CODE, so this ticket is a request-and-decide, not a build: the per-domain issuer paces orders at min_order_interval = 36s to match 300/3h, ACROSS sweeps rather than only within one (a sweep boundary would otherwise be a free order), and a configured 0 is rejected at parse rather than read as unlimited. Per-domain concurrency is the cert store's CAS claim, and a failed order rewrites that claim with a 1h TTL so the claim object doubles as the backoff marker — flat, not exponential, because the common failure is 'the tenant has not added the CNAME yet' and an exponential curve only delays their first success. See oss/yubaba/crates/yubaba/src/domain_issuer.rs.")
+//!
+//! @yah:ticket(R853-F4, "External Account Binding in acme-engine, so a second CA can absorb order overflow")
+//! @yah:at(2026-09-03T06:34:51Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R853)
+//! @yah:depends_on(R853-T3)
+//! @yah:next("CONDITIONAL — build this ONLY if R853-T3 comes back refused. ZeroSSL and Google Trust Services both require External Account Binding, and acme-engine has none: confirmed by grep, there is no EAB code anywhere in the crate. The hook is instant-acme's NewAccount ExternalAccountKey, applied in load_or_create_account (oss/passway/crates/acme-engine/src/lib.rs) alongside the directory_root_cert fork R779 P8 added there.")
+//! @yah:next("THE STORAGE LAYOUT ALREADY ACCOMMODATES A SECOND CA — do not redesign it. Cert objects live at certs/&lt;issuer&gt;/&lt;domain&gt;/{cert.sealed,key.sealed,issuing}, where issuer is the ACME directory host (mirroring certmagic's certificates/&lt;issuer-key&gt;/&lt;domain&gt;/), so adding a CA is a write and not a migration. The ENROLLMENT set lives at enrolled/&lt;domain&gt;, deliberately OUTSIDE certs/&lt;issuer&gt;/, because enrolment is a fact about a tenant rather than about a CA — so a domain stays routable while its cert moves between CAs. See oss/yubaba/crates/yubaba/src/cert_store.rs.")
 
 use std::collections::HashMap;
 use std::io;
@@ -143,8 +161,24 @@ pub enum AcmeChallengeKind {
         /// custom tenant domain is issued without either holding its zone or
         /// standing up an `:80` tier. See [`dns01_record_name`].
         delegate_zone: Option<String>,
+        /// Base URL of the Cloudflare-shaped API these TXT records are
+        /// created/deleted against, without a trailing `/zones/…` path.
+        ///
+        /// `None` — the production default — means
+        /// [`CLOUDFLARE_API_BASE`], i.e. the real Cloudflare API. The only
+        /// reason to set it is to point the publisher at a stand-in that
+        /// speaks the same two endpoints: the DNS-01 integration test
+        /// (`tests/pebble_dns01_delegation.rs`) runs a shim that forwards
+        /// into a Pebble challtestsrv, which is how the delegation record
+        /// name is proven against a real CA. A trailing `/` is trimmed, so
+        /// `…/v4` and `…/v4/` behave identically.
+        api_base: Option<String>,
     },
 }
+
+/// The production Cloudflare API base every DNS-01 publish goes to unless
+/// [`AcmeChallengeKind::Dns01Cloudflare::api_base`] overrides it.
+pub const CLOUDFLARE_API_BASE: &str = "https://api.cloudflare.com/client/v4";
 
 /// Where the DNS-01 TXT record for `base` is published.
 ///
@@ -190,6 +224,16 @@ pub struct IssueConfig {
     /// before telling the ACME server to validate — covers the provider's
     /// authoritative-edge propagation. Unused under HTTP-01.
     pub dns01_propagation_delay: Duration,
+    /// Path to a PEM root certificate to trust **for the ACME directory
+    /// connection**, and nothing else.
+    ///
+    /// `None` — the production default — trusts only the public roots. This
+    /// is the private-CA / test-CA hook, not a general TLS knob: it is the
+    /// only way to talk to a directory whose own certificate is not publicly
+    /// chained (Pebble, step-ca, an internal CA). It does not affect the
+    /// DNS-01 provider client, and it does not affect validation of the cert
+    /// this engine returns.
+    pub directory_root_cert: Option<String>,
 }
 
 /// A freshly issued cert chain + private key, in memory. The caller decides
@@ -324,6 +368,19 @@ struct Dns01Ctx {
     token: String,
     zone_id: String,
     delegate_zone: Option<String>,
+    /// Already resolved: the operator's override with any trailing `/`
+    /// trimmed, or [`CLOUDFLARE_API_BASE`].
+    api_base: String,
+}
+
+/// Resolve an operator-supplied API base to the string the two request
+/// builders concatenate onto. `None` → the production constant; a trailing
+/// `/` is trimmed so `…/v4/` and `…/v4` produce the same URL.
+fn resolve_api_base(configured: Option<&str>) -> String {
+    match configured {
+        Some(base) if !base.trim().is_empty() => base.trim().trim_end_matches('/').to_string(),
+        _ => CLOUDFLARE_API_BASE.to_string(),
+    }
 }
 
 /// Create a `_acme-challenge` TXT record. Deliberately a bare create, not
@@ -332,12 +389,13 @@ struct Dns01Ctx {
 /// coexist for validation — an upsert would clobber the first.
 async fn cloudflare_create_txt(
     client: &reqwest::Client,
+    api_base: &str,
     token: &str,
     zone_id: &str,
     name: &str,
     content: &str,
 ) -> Result<String, AcmeError> {
-    let url = format!("https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records");
+    let url = format!("{api_base}/zones/{zone_id}/dns_records");
     let body = serde_json::json!({
         "type": "TXT",
         "name": name,
@@ -376,11 +434,12 @@ async fn cloudflare_create_txt(
 /// logged, never fatal.
 async fn cloudflare_delete_record(
     client: &reqwest::Client,
+    api_base: &str,
     token: &str,
     zone_id: &str,
     record_id: &str,
 ) -> Result<(), AcmeError> {
-    let url = format!("https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}");
+    let url = format!("{api_base}/zones/{zone_id}/dns_records/{record_id}");
     let resp = client
         .delete(&url)
         .bearer_auth(token)
@@ -400,6 +459,18 @@ async fn cloudflare_delete_record(
 // ACME account + issuance
 // ---------------------------------------------------------------------------
 
+/// Build the `AccountBuilder` for this config's directory connection.
+///
+/// `directory_root_cert` is the only fork: with it, the HTTPS client trusts
+/// exactly that one PEM root instead of the public set, which is what lets
+/// this engine speak to a Pebble/step-ca/private directory.
+fn account_builder(config: &IssueConfig) -> Result<instant_acme::AccountBuilder, AcmeError> {
+    match &config.directory_root_cert {
+        Some(pem_path) => Account::builder_with_root(pem_path).map_err(AcmeError::from),
+        None => Account::builder().map_err(AcmeError::from),
+    }
+}
+
 async fn load_or_create_account(config: &IssueConfig) -> Result<Account, AcmeError> {
     let cache_path = Path::new(&config.account_cache_path);
     if let Ok(existing) = std::fs::read_to_string(cache_path) {
@@ -408,7 +479,7 @@ async fn load_or_create_account(config: &IssueConfig) -> Result<Account, AcmeErr
                 "corrupt ACME account cache at {cache_path:?}: {e} — remove the file to force re-registration"
             ))
         })?;
-        return Ok(Account::builder()?.from_credentials(credentials).await?);
+        return Ok(account_builder(config)?.from_credentials(credentials).await?);
     }
 
     log::info!(
@@ -416,7 +487,7 @@ async fn load_or_create_account(config: &IssueConfig) -> Result<Account, AcmeErr
         config.contact_email
     );
     let contact = format!("mailto:{}", config.contact_email);
-    let (account, credentials) = Account::builder()?
+    let (account, credentials) = account_builder(config)?
         .create(
             &NewAccount {
                 contact: &[&contact],
@@ -456,6 +527,7 @@ pub async fn issue(config: &IssueConfig, tokens: &ChallengeTokens) -> Result<Iss
             token_file,
             zone_id,
             delegate_zone,
+            api_base,
         } => {
             let token = std::fs::read_to_string(token_file)
                 .map_err(|e| {
@@ -468,6 +540,7 @@ pub async fn issue(config: &IssueConfig, tokens: &ChallengeTokens) -> Result<Iss
                 token,
                 zone_id: zone_id.clone(),
                 delegate_zone: delegate_zone.clone(),
+                api_base: resolve_api_base(api_base.as_deref()),
             })
         }
     };
@@ -542,6 +615,7 @@ pub async fn issue(config: &IssueConfig, tokens: &ChallengeTokens) -> Result<Iss
                     let name = dns01_record_name(&base, ctx.delegate_zone.as_deref());
                     let record_id = cloudflare_create_txt(
                         &ctx.client,
+                        &ctx.api_base,
                         &ctx.token,
                         &ctx.zone_id,
                         &name,
@@ -597,9 +671,14 @@ pub async fn issue(config: &IssueConfig, tokens: &ChallengeTokens) -> Result<Iss
     }
     if let Some(ctx) = &dns01 {
         for record in &created_records {
-            if let Err(e) =
-                cloudflare_delete_record(&ctx.client, &ctx.token, &ctx.zone_id, &record.record_id)
-                    .await
+            if let Err(e) = cloudflare_delete_record(
+                &ctx.client,
+                &ctx.api_base,
+                &ctx.token,
+                &ctx.zone_id,
+                &record.record_id,
+            )
+            .await
             {
                 log::warn!(
                     "acme-engine: failed to clean up TXT {} (record {}) — it has a 60s TTL and \
@@ -795,5 +874,23 @@ mod tests {
             dns01_record_name("shop.tenant.io.", Some("acme.yah.dev.")),
             "shop.tenant.io.acme.yah.dev"
         );
+    }
+
+    // -- resolve_api_base ----------------------------------------------
+
+    #[test]
+    fn no_configured_api_base_is_the_production_cloudflare_endpoint() {
+        // Every production path leaves this `None`, so this is the assertion
+        // that the override changed nothing for them.
+        assert_eq!(resolve_api_base(None), CLOUDFLARE_API_BASE);
+        assert_eq!(resolve_api_base(Some("  ")), CLOUDFLARE_API_BASE);
+    }
+
+    #[test]
+    fn a_trailing_slash_on_the_api_base_does_not_double_up() {
+        // `…/v4/` and `…/v4` must build the same `/zones/…` URL — an
+        // operator copying a base out of a doc page brings the slash.
+        assert_eq!(resolve_api_base(Some("http://127.0.0.1:8080/")), "http://127.0.0.1:8080");
+        assert_eq!(resolve_api_base(Some(" http://127.0.0.1:8080 ")), "http://127.0.0.1:8080");
     }
 }

@@ -25,7 +25,7 @@ resolver = "2"
 # the types stop unifying (E0308 everywhere). Pinned by `rev`, never `branch`:
 # a moving branch in a [patch] block makes the build non-reproducible.
 [workspace.package]
-version = "0.8.30"
+version = "0.8.32"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"

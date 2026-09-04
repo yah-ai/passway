@@ -19,9 +19,11 @@
 //! | `PASSWAY_ACME_DNS01_CLOUDFLARE_TOKEN_FILE` | path to a file holding a CF API token with `DNS:Edit` on the zone | required if `dns-01` |
 //! | `PASSWAY_ACME_DNS01_CLOUDFLARE_ZONE_ID` | CF zone ID the `_acme-challenge` TXT records are created in | required if `dns-01` |
 //! | `PASSWAY_ACME_DNS01_DELEGATE_ZONE` | R779: publish the challenge TXT at `<domain>.<this zone>` instead of `_acme-challenge.<domain>` — for a domain whose zone we do not hold, whose owner CNAMEs `_acme-challenge.<domain>` here | unset (we hold the zone) |
+//! | `PASSWAY_ACME_CF_API_BASE` | R779: base URL the DNS-01 TXT create/delete calls go to, e.g. `http://127.0.0.1:8080`. A test hook only — the DNS-01 integration harness points it at a Cloudflare-shaped shim; leave it unset in production | unset (`https://api.cloudflare.com/client/v4`) |
 //! | `PASSWAY_ACME_DNS01_PROPAGATION_SECS` | wait between publishing a TXT record and asking the CA to validate | `10` |
 //! | `PASSWAY_ACME_ACCOUNT_CACHE` | path to cache ACME account credentials (JSON) | `<PASSWAY_TLS_CERT>.acme-account.json` |
 //! | `PASSWAY_ACME_HTTP01_BIND` | address the HTTP-01 challenge responder binds | `0.0.0.0:80` |
+//! | `PASSWAY_HTTP_REDIRECT_BIND` | R330-F37: address a plain-HTTP listener binds to answer `308 https://<host><path>`. A front door on a grey apex needs this or scheme-less `curl yah.dev/...` (which dials `:80`) is refused. Refuses to start alongside an `http-01` responder on the same address — see [`passway::redirect`] | unset (no plain-HTTP listener) |
 //! | `PASSWAY_ACME_RENEW_BEFORE_DAYS` | renew when within this many days of expiry | `30` |
 //! | `PASSWAY_ACME_CHECK_INTERVAL_SECS` | how often the renewal loop wakes to check | `43200` (12h) |
 //! | `PASSWAY_ACME_CERT_LIFETIME_DAYS` | assumed cert validity (LE/ZeroSSL standard) | `90` |
@@ -31,6 +33,7 @@
 //! | `PASSWAY_UPSTREAM_SOURCE` | `static` (from `PASSWAY_UPSTREAMS`) or `yubaba` (R594-F8 discovery) | `static` |
 //! | `PASSWAY_UPSTREAMS` | comma-separated backend list, optionally `<hostname>=` prefixed to give each fronted service its own set (`static` source only — see below) | empty (fail-ready 503) |
 //! | `PASSWAY_YUBABA_URL` | base URL of the yubaba to discover upstreams from, e.g. `http://100.64.0.2:7443` | required if `PASSWAY_UPSTREAM_SOURCE=yubaba` |
+//! | `PASSWAY_YUBABA_IDENT` | R844-B6: workload ident whose service records become this proxy's backends. A node hosts several workloads and the endpoint answers for all of them, so without this passway would adopt every Ready record on the node. R844-F20: optionally `<hostname>=` prefixed, exactly like `PASSWAY_UPSTREAMS`, to give each fronted hostname its own discovered set | required if `PASSWAY_UPSTREAM_SOURCE=yubaba` |
 //! | `PASSWAY_YUBABA_TIMEOUT_SECS` | per-request timeout for a discovery poll | `5` |
 //! | `PASSWAY_UPSTREAM_TLS` | speak TLS to upstreams (`true`/`false`) | `false` (mesh is already encrypted) |
 //! | `PASSWAY_UPSTREAM_SNI` | SNI to present when `PASSWAY_UPSTREAM_TLS=true` | empty |
@@ -107,9 +110,52 @@
 //! which is a catch-all, and a catch-all on a multi-tenant front door has to
 //! be typed on purpose (`*=`) — not arrived at by forgetting a prefix.
 //!
-//! `PASSWAY_UPSTREAM_SOURCE=yubaba` is one flat set, so it becomes the
-//! catch-all; per-host dynamic discovery is R594-F6/F8 territory and does not
-//! gate this.
+//! ## Per-host DISCOVERY, not just per-host addresses (R844-F20)
+//!
+//! `PASSWAY_UPSTREAM_SOURCE=yubaba` used to be one flat set adopted as the
+//! catch-all, which meant a door fronting several hostnames could not use
+//! discovery at all — it had to be *told* its backends statically. That is the
+//! literal port pin R844 exists to delete, relocated from a TOML file into an
+//! operator's terminal: every time a supervisor allocated a new port, a human
+//! had to retype it here. On 2026-09-03 that cost yah.dev four minutes of 503s.
+//!
+//! `PASSWAY_YUBABA_IDENT` therefore takes the **same `<hostname>=` fan-in
+//! grammar** as `PASSWAY_UPSTREAMS`, naming the workload to discover rather
+//! than the address to dial:
+//!
+//! ```text
+//! PASSWAY_YUBABA_IDENT=yah.dev=yah-marketing,analytics.yah.dev=yah-analytics
+//! ```
+//!
+//! One polling source per hostname, each filtered to its own workload ident
+//! (R844-B6), each round-robined and health-checked independently — the same
+//! [`routing::HostRouter`](passway::routing::HostRouter) the static path
+//! already fills. A bare `PASSWAY_YUBABA_IDENT=yah-marketing` is still the
+//! catch-all, so every existing deployment is unchanged, and `*=yah-marketing`
+//! says the same thing on purpose.
+//!
+//! Two shapes are boot failures rather than guesses. **Mixing** bare and
+//! prefixed entries is rejected for the `PASSWAY_UPSTREAMS` reason above.
+//! **Repeating** a hostname is rejected too — and this is where the two
+//! variables differ: repeating a hostname in `PASSWAY_UPSTREAMS` *adds an
+//! address* to its set, but a hostname has exactly one workload behind it, so
+//! two idents for it has no meaning that is not a guess.
+//!
+//! @yah:relay(R853, "R779 outward actions: publish the pingora fork upstream, put the demux on :443 in front of the live origins, and settle the ACME order budget")
+//! @yah:at(2026-09-03T06:33:30Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:next("Split out of R779 at its P8 close-out. R779's code is complete and verified; these three are the actions that make it REACH the world, and every one of them is outward-facing (a public PR, a change to live yah.dev origins, a request to a third party) rather than something a session should do unsupervised. They were sitting as @yah:next prose on R779, which would have been stripped from source when R779 archived — filed as real tickets so they survive it. Design canon: .yah/docs/working/W267-sovereign-public-ingress.md.")
+//!
+//! @yah:ticket(R853-T1, "Upstream the seed-listen-fds patch to cloudflare/pingora, then drop the fork pin")
+//! @yah:at(2026-09-03T06:33:42Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R853)
+//! @yah:blocked_on(operator)
+//! @yah:next("THE OPERATOR ACTION: open a PR against cloudflare/pingora main from github.com/yah-ai/pingora branch yah/seed-listen-fds-0.8.1 = 2f52d944c832089bad6bd847b868d5c9f37fb201 (tag 0.8.1 plus the carried patch). Three hunks: `Server::seed_listen_fd(bind, fd)` + `Bootstrap::seed_fd` merged into the same fd table the SCM_RIGHTS upgrade path fills (upgrade wins for the same bind), and `listeners::l4::from_raw_fd` setting the adopted fd non-blocking. That last hunk is NOT cosmetic — a std-bound socket is blocking and tokio's from_std leaves it so, which stalled a worker on the first accept until a test caught it. On main, Bootstrap.listen_fds is already a non-optional ListenFds, so load_fds merges instead of replacing. Carried patch + rationale: oss/passway/patches/pingora-0.8.1-seed-listen-fds.patch and patches/README.md.")
+//! @yah:next("THE AGENT HALF, once it merges and a release ships: three things move TOGETHER or the build breaks — oss/passway/Cargo.toml's [patch.crates-io] block (all 14 pingora crates, pinned to the fork rev), oss/passway/crates/passway/Cargo.toml's `default = [\"socket-activation\"]`, and oss/passway/deny.toml's allow-git entry for yah-ai/pingora. The socket-activation feature does not compile against crates.io pingora, by design.")
+//! @yah:gotcha("Patching pingora-core ALONE fails confusingly: pingora-error / pingora-http end up duplicated registry-vs-fork and the types stop unifying, giving E0308 everywhere. All 14 pingora crates in the graph must come from the same source. Also: a cold build of oss/passway now REQUIRES network access to github.com/yah-ai/pingora — an offline machine gets a resolution failure, not a compile error. The rev is public, so it is a reachability question, not a permissions one. Recorded in oss/passway/patches/README.md.")
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -126,6 +172,7 @@ use passway::auth::{CheersAuth, RouteAuthPolicy};
 use passway::discovery::{YubabaDiscoveryConfig, YubabaUpstreams};
 use passway::idle::{IdleReaper, IdleTracker};
 use passway::proxy::PassProxy;
+use passway::redirect;
 use passway::routing::{build_host_router, HostKey, CATCH_ALL_LABEL};
 use passway::tls::{build_tls_settings, TlsMode};
 use passway::upstream::{StaticUpstreams, UpstreamSource};
@@ -219,6 +266,81 @@ fn parse_upstream_sets(raw: &str) -> Result<Vec<(HostKey, Vec<SocketAddr>)>, Str
     Ok(sets.into_iter().collect())
 }
 
+/// Parse `PASSWAY_YUBABA_IDENT` into one workload ident per fronted hostname
+/// (R844-F20).
+///
+/// Same `<hostname>=<value>` fan-in grammar as [`parse_upstream_sets`], and
+/// deliberately so: the two variables answer the same question — *which
+/// backends serve this hostname* — one by naming addresses and one by naming
+/// the workload to discover them from. An operator who has written one should
+/// not have to learn a second shape to write the other.
+///
+/// ```text
+/// yah-marketing                                        # catch-all, the pre-F20 form
+/// *=yah-marketing                                      # the same, said explicitly
+/// yah.dev=yah-marketing,analytics.yah.dev=yah-analytics # per host
+/// ```
+///
+/// Two structural errors, both boot failures rather than warnings. **Mixing**
+/// a bare entry with keyed ones is the [`parse_upstream_sets`] rule for the
+/// same reason: the only reading is an accidental catch-all, and a catch-all
+/// on a multi-tenant door serves one tenant's traffic from another's backends.
+/// **Repeating** a hostname is an error here where the address parser merges,
+/// because a hostname has exactly one workload behind it — merging two idents
+/// would silently pick one, and picking one is the guess this relay exists to
+/// remove.
+fn parse_ident_sets(raw: &str) -> Result<Vec<(HostKey, String)>, String> {
+    let mut sets: BTreeMap<HostKey, String> = BTreeMap::new();
+    let mut bare: Vec<&str> = Vec::new();
+    let mut keyed: Vec<&str> = Vec::new();
+
+    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (key, ident) = match entry.split_once('=') {
+            Some((host, ident)) => {
+                let host = host.trim();
+                if host == CATCH_ALL_LABEL {
+                    (HostKey::CatchAll, ident.trim())
+                } else if host.is_empty() {
+                    return Err(format!(
+                        "PASSWAY_YUBABA_IDENT entry {entry:?} has an empty hostname"
+                    ));
+                } else {
+                    keyed.push(host);
+                    (HostKey::Host(host.to_string()), ident.trim())
+                }
+            }
+            None => {
+                bare.push(entry);
+                (HostKey::CatchAll, entry)
+            }
+        };
+        if ident.is_empty() {
+            return Err(format!(
+                "PASSWAY_YUBABA_IDENT entry {entry:?} names no workload ident. An empty ident \
+                 would adopt every Ready record on the polled node (R844-B6)."
+            ));
+        }
+        if let Some(prior) = sets.insert(key.clone(), ident.to_string()) {
+            return Err(format!(
+                "PASSWAY_YUBABA_IDENT names {key:?} twice, as {prior:?} and {ident:?}. A \
+                 hostname is fronted by exactly one workload; two idents for it has no \
+                 meaning that is not a guess."
+            ));
+        }
+    }
+
+    if !bare.is_empty() && !keyed.is_empty() {
+        return Err(format!(
+            "PASSWAY_YUBABA_IDENT mixes unprefixed entries ({bare:?}) with host-prefixed ones \
+             ({keyed:?}). An unprefixed entry means \"discover every hostname's backends from \
+             this workload\", which on a host-routed front door is a catch-all — write it as \
+             \"*=<ident>\" if that is what you meant, or give it a hostname prefix."
+        ));
+    }
+
+    Ok(sets.into_iter().collect())
+}
+
 /// Pick the [`UpstreamSource`]s from `PASSWAY_UPSTREAM_SOURCE` (R594-F8),
 /// one per fronted hostname (R594-F10).
 ///
@@ -262,17 +384,45 @@ fn build_upstream_sources() -> Vec<(HostKey, Arc<dyn UpstreamSource>)> {
         "yubaba" => {
             let base_url = std::env::var("PASSWAY_YUBABA_URL")
                 .expect("PASSWAY_YUBABA_URL is required with PASSWAY_UPSTREAM_SOURCE=yubaba");
-            let config = YubabaDiscoveryConfig {
-                base_url,
-                timeout: env_secs("PASSWAY_YUBABA_TIMEOUT_SECS", 5),
-            };
-            log::info!(
-                "upstream discovery: polling {} every PASSWAY_UPDATE_INTERVAL_SECS",
-                config.url()
-            );
-            // One flat set, so it serves every authority — per-host dynamic
-            // discovery is R594-F6/F8 territory (see the module doc).
-            vec![(HostKey::CatchAll, Arc::new(YubabaUpstreams::new(&config)))]
+            // Required, not defaulted: an unset ident would make this proxy
+            // adopt every Ready record on the polled node (R844-B6), which is
+            // the failure a default would hide. Loud at boot, same as a
+            // missing URL.
+            let raw = std::env::var("PASSWAY_YUBABA_IDENT")
+                .expect("PASSWAY_YUBABA_IDENT is required with PASSWAY_UPSTREAM_SOURCE=yubaba");
+            let sets = parse_ident_sets(&raw)
+                .unwrap_or_else(|e| panic!("invalid PASSWAY_YUBABA_IDENT: {e}"));
+            if sets.is_empty() {
+                panic!(
+                    "PASSWAY_YUBABA_IDENT is set but names no workload — see \
+                     PASSWAY_UPSTREAM_SOURCE=yubaba in this binary's module docs"
+                );
+            }
+            // R844-F20: one discovery source PER FRONTED HOSTNAME, not one flat
+            // set adopted as the catch-all. That flat shape is why a door
+            // fronting several hostnames could not use discovery at all and had
+            // to be TOLD its backends statically — which is the literal port pin
+            // R844 exists to delete, relocated from a TOML file into an
+            // operator's terminal.
+            sets.into_iter()
+                .map(|(key, ident)| {
+                    let config = YubabaDiscoveryConfig {
+                        base_url: base_url.clone(),
+                        ident,
+                        timeout: env_secs("PASSWAY_YUBABA_TIMEOUT_SECS", 5),
+                    };
+                    log::info!(
+                        "upstream discovery for {key:?}: polling {} for records of ident {:?} \
+                         every PASSWAY_UPDATE_INTERVAL_SECS",
+                        config.url(),
+                        config.ident
+                    );
+                    (
+                        key,
+                        Arc::new(YubabaUpstreams::new(&config)) as Arc<dyn UpstreamSource>,
+                    )
+                })
+                .collect()
         }
         other => panic!(
             "PASSWAY_UPSTREAM_SOURCE {other:?} is not recognized (expected \"static\" or \"yubaba\")"
@@ -333,6 +483,29 @@ fn main() {
     let acme_config: Option<AcmeConfig> =
         acme::parse_acme_config(|k| std::env::var(k).ok(), cert_path.clone(), key_path.clone())
             .unwrap_or_else(|e| panic!("invalid ACME configuration: {e}"));
+
+    // R330-F37: a grey (DNS-only) apex has no edge answering port 80, and
+    // every install one-liner this project documents is scheme-less — curl
+    // reads `yah.dev/install.sh` as `http://` and gets a refused connection
+    // while HTTPS keeps returning 200. Opt-in, because `crate::acme`'s
+    // HTTP-01 responder defaults to the same port and must win it when it is
+    // in use; see `crate::redirect`.
+    let redirect_bind = redirect::parse_redirect_bind(|k| std::env::var(k).ok())
+        .unwrap_or_else(|e| panic!("invalid HTTP-redirect configuration: {e}"));
+    if let (Some(bind), Some(acme)) = (redirect_bind, acme_config.as_ref()) {
+        if matches!(acme.challenge, acme::AcmeChallengeKind::Http01)
+            && redirect::redirect_conflicts_with_acme(bind, acme.http01_bind)
+        {
+            panic!(
+                "{} is {bind} but PASSWAY_ACME_CHALLENGE=http-01 needs {} for validation — two \
+                 listeners on one address is a race whose loser is a silently failed renewal. \
+                 Move one of them, or switch to PASSWAY_ACME_CHALLENGE=dns-01 (which validates \
+                 at the DNS provider and leaves port 80 free).",
+                redirect::REDIRECT_BIND_ENV,
+                acme.http01_bind,
+            );
+        }
+    }
 
     let tls_mode = match &acme_config {
         Some(_) => TlsMode::Acme {
@@ -485,6 +658,11 @@ fn main() {
     if let Some(reaper) = idle_reaper {
         server.add_service(reaper);
     }
+    if let Some(bind) = redirect_bind {
+        let redirect_service =
+            background_service("passway http redirect", redirect::HttpRedirectService::new(bind));
+        server.add_service(redirect_service);
+    }
     if let Some(config) = acme_config {
         let acme_service = background_service("passway acme renewal", acme::AcmeRenewalService::new(config));
         server.add_service(acme_service);
@@ -590,6 +768,81 @@ mod tests {
         assert_eq!(
             sets,
             vec![(HostKey::Host("a.example.com".into()), vec![addr("[::1]:9001")])]
+        );
+    }
+
+    // ── PASSWAY_YUBABA_IDENT, per host (R844-F20) ────────────────────────────
+
+    /// Every deployment written before F20 keeps working, unchanged, and that
+    /// is the property the whole change rests on.
+    #[test]
+    fn a_bare_ident_is_still_the_catch_all() {
+        assert_eq!(
+            parse_ident_sets("yah-marketing").unwrap(),
+            vec![(HostKey::CatchAll, "yah-marketing".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_star_prefix_says_catch_all_on_purpose() {
+        assert_eq!(
+            parse_ident_sets("*=yah-marketing").unwrap(),
+            parse_ident_sets("yah-marketing").unwrap()
+        );
+    }
+
+    #[test]
+    fn host_prefixes_give_each_hostname_its_own_workload() {
+        assert_eq!(
+            parse_ident_sets("yah.dev=yah-marketing, analytics.yah.dev=yah-analytics").unwrap(),
+            vec![
+                (
+                    HostKey::Host("analytics.yah.dev".into()),
+                    "yah-analytics".to_string()
+                ),
+                (HostKey::Host("yah.dev".into()), "yah-marketing".to_string()),
+            ]
+        );
+    }
+
+    /// The one place this grammar deliberately differs from
+    /// `PASSWAY_UPSTREAMS`, where a repeated hostname ADDS an address. A
+    /// hostname has exactly one workload behind it, so two idents for it is
+    /// not a set — it is a guess about which one wins.
+    #[test]
+    fn a_repeated_hostname_is_an_error_rather_than_a_silent_pick() {
+        let err = parse_ident_sets("yah.dev=yah-marketing,yah.dev=yah-analytics")
+            .expect_err("two idents for one hostname must not be resolved by ordering");
+        assert!(err.contains("yah-marketing"), "{err}");
+        assert!(err.contains("yah-analytics"), "{err}");
+    }
+
+    /// Same rule, and the same reason, as the address parser: an unprefixed
+    /// entry alongside prefixed ones reads as "and everything else goes here",
+    /// which on a multi-tenant door serves one tenant from another's backends.
+    #[test]
+    fn mixing_bare_and_prefixed_entries_is_a_boot_failure() {
+        let err = parse_ident_sets("yah-marketing,analytics.yah.dev=yah-analytics")
+            .expect_err("an accidental catch-all must not be guessed at");
+        assert!(err.contains("*=<ident>"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_ident_is_rejected_because_it_would_adopt_every_record() {
+        let err = parse_ident_sets("yah.dev=").expect_err("an empty ident is not a filter");
+        assert!(err.contains("R844-B6"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_hostname_is_rejected_in_the_ident_grammar_too() {
+        assert!(parse_ident_sets("=yah-marketing").is_err());
+    }
+
+    #[test]
+    fn whitespace_and_empty_entries_are_tolerated_like_the_address_grammar() {
+        assert_eq!(
+            parse_ident_sets(" yah.dev = yah-marketing , , ").unwrap(),
+            vec![(HostKey::Host("yah.dev".into()), "yah-marketing".to_string())]
         );
     }
 }
