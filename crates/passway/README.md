@@ -33,8 +33,8 @@ PASSWAY_UPSTREAMS=10.0.0.1:8080,10.0.0.2:8080 \
 | `PASSWAY_TLS_CERT` | PEM cert chain path | required |
 | `PASSWAY_TLS_KEY` | PEM private key path | required |
 | `PASSWAY_UPSTREAMS` | comma-separated backend list, optionally `<hostname>=` prefixed (see below) | empty (fail-ready 503) |
-| `PASSWAY_UPSTREAM_TLS` | speak TLS to upstreams | `false` |
-| `PASSWAY_UPSTREAM_SNI` | SNI when `PASSWAY_UPSTREAM_TLS=true` | empty |
+| `PASSWAY_UPSTREAM_TLS` | speak TLS to upstreams — bare `true`/`false`, or `<hostname>=` prefixed to give one fronted service its own scheme | `false` |
+| `PASSWAY_UPSTREAM_SNI` | SNI when upstream TLS is on — bare string, or the same `<hostname>=` prefixed form | empty |
 | `PASSWAY_HEALTH_PATH` | readiness path | `/health` |
 | `PASSWAY_HEALTH_CHECK_INTERVAL_SECS` | TCP health-check cadence | `5` |
 | `PASSWAY_UPDATE_INTERVAL_SECS` | upstream re-poll cadence | `30` |

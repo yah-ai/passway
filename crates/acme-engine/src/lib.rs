@@ -46,13 +46,29 @@
 //!   validation never touches the node.
 //!
 //! @yah:ticket(R853-T3, "Settle the Let's Encrypt order budget for the 10k fill: file the rate-limit adjustment request")
-//! @yah:at(2026-09-03T06:34:32Z)
-//! @yah:status(open)
+//! @yah:at(2026-09-05T19:27:09Z)
+//! @yah:status(review)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R853)
-//! @yah:blocked_on(operator)
 //! @yah:next("R779 Decision 3, the procurement half. The binding limit is per-ACCOUNT new orders: 300 / 3h, i.e. 2400/day, which fills 10k domains in ~4.2 days without asking anyone. The plan of record is to QUEUE under the cap and file Let's Encrypt's rate-limit adjustment form once projected volume approaches ~2k/day. That filing is the operator action here. (Do NOT inherit W273's duplicate-certificate number — that limit is per identical SAN set and does not bind on 10k distinct registered domains.)")
 //! @yah:next("ALREADY ENFORCED IN CODE, so this ticket is a request-and-decide, not a build: the per-domain issuer paces orders at min_order_interval = 36s to match 300/3h, ACROSS sweeps rather than only within one (a sweep boundary would otherwise be a free order), and a configured 0 is rejected at parse rather than read as unlimited. Per-domain concurrency is the cert store's CAS claim, and a failed order rewrites that claim with a 1h TTL so the claim object doubles as the backoff marker — flat, not exponential, because the common failure is 'the tenant has not added the CNAME yet' and an exponential curve only delays their first success. See oss/yubaba/crates/yubaba/src/domain_issuer.rs.")
+//! @yah:next("DRAFT WRITTEN 2026-09-05 at .yah/docs/working/R853-T3-le-rate-limit-request.md — operator answered 'file the form, I draft it, you submit'. It is field-by-field against the REAL form (fetched and parsed, 179 labels), with the free-text service description paste-ready and every ungroundable field marked [YOU]. Delete the file once submitted; it is a scratch artifact, not canon.")
+//! @yah:next("BUT THE ARITHMETIC SAYS THE LIMIT DOES NOT BIND, and the operator should see this before submitting — re-read live from letsencrypt.org 2026-09-05 rather than inherited. New Orders per Account is 300/3h = 2,400/day = **16,800/week**. The fill is 10,000 orders (W267:3007 — the 10k are CUSTOM tenant domains, i.e. distinct registered domains, one identifier each). 10,000 < 16,800, so the whole fill fits in one week under the DEFAULT limit with 40% headroom, completing in ~4.2 days at the shipped 36s pacing — which W267:3042 already recorded and W267:3044 already accepted. This ticket's own trigger condition ('file once projected volume approaches ~2k/day') has not fired: projected volume is zero, the demux is not on :443 yet (R853-T2 in review).")
+//! @yah:gotcha("RENEWALS COST NOTHING AGAINST THIS LIMIT, which removes the main reason to think the budget gets tight at steady state. LE's 'Limit Exemptions for Renewals' section: ARI renewals are exempt from ALL rate limits, and even NON-ARI renewals — an order whose identifier set exactly matches an earlier cert — are 'exempt from the New Orders per Account and New Certificates per Registered Domain rate limits'. The per-domain issuer orders exactly one identifier per domain (pinned by domain_issuer.rs's a_tenant_order_covers_exactly_its_own_domain_and_nothing_else), so every steady-state renewal qualifies under the non-ARI path. Steady state at 10k domains therefore draws ZERO from the 300/3h budget, not the ~1,167/week you would otherwise compute. We use instant-acme 0.8.5 and have no ARI code (grepped: no renewal_info / replaces anywhere), so we are on the non-ARI path — sufficient here, though ARI would additionally exempt us from the auth-failure and exact-set limits.")
+//! @yah:gotcha("THE FLEET WILDCARD IS THE ONE PLACE THIS INTERACTS WITH R853-B9, and it cuts against widening. Non-ARI renewal exemption requires the EXACT same identifier set. The fleet cert's set is [yah.dev, *.yah.dev] + YUBABA_ACME_EXTRA_DOMAINS, so the moment an operator widens that list the new order is NOT a renewal: it consumes New Orders budget AND becomes subject to New Certificates per Exact Set of Identifiers (5 per 7 days) for the new set. Widening the fleet SAN list more than 5 times in a week will therefore be refused by LE regardless of any account-level override, because that limit is explicitly non-overridable ('We do not offer overrides for this limit').")
+//! @yah:gotcha("FORM FIELD WITH NO CORRECT ANSWER, so decide before opening the tab rather than mid-form: 'What ACME client do you use?' is a required dropdown with no free-text escape. Checked all 179 form labels — no instant-acme, no rustls-acme, nothing Rust, and no 'Other' option. Ours is instant-acme 0.8.5 (oss/passway/Cargo.lock:1358) wrapped in our own acme-engine crate. The draft recommends the literally-named 'Yet another ACME client' entry plus a disambiguating sentence in the free-text box.")
+//! @yah:handoff("SETTLED 2026-09-05, operator decision: DO NOT FILE the rate-limit adjustment request. Queue under the existing cap. The ticket's question — 'settle the Let's Encrypt order budget for the 10k fill' — is answered; it is answered 'nothing to procure', which is a resolution and not a deferral. blocked_on(operator) cleared.")
+//! @yah:handoff("THE REASON IS ARITHMETIC, re-read live from letsencrypt.org rather than inherited from this ticket's filing text. New Orders per Account is 300 / 3h, refilling 1 per 36s — 2,400/day, **16,800/week**. The fill is 10,000 orders: W267:3007 establishes the 10k are CUSTOM tenant domains, i.e. distinct registered domains taking one identifier each. 10,000 < 16,800, so the entire fill fits inside a single week under the DEFAULT limit with ~40% headroom, completing in ~4.2 days at the shipped 36s pacing. That 4.2-day figure was already in W267:3042 and already accepted at W267:3044 ('a free tier does not deliver 10k domains in one day anyway'). There is no override to ask for.")
+//! @yah:handoff("TWO FINDINGS THAT MADE THE CASE WEAKER STILL, neither of which was in the ticket. (1) RENEWALS DRAW ZERO from this budget. LE's 'Limit Exemptions for Renewals' section: ARI renewals are exempt from ALL rate limits, and even non-ARI renewals — an order whose identifier set exactly matches an earlier cert — are 'exempt from the New Orders per Account and New Certificates per Registered Domain rate limits'. The per-domain issuer orders exactly one identifier per domain (now pinned by domain_issuer.rs's a_tenant_order_covers_exactly_its_own_domain_and_nothing_else), so every steady-state renewal qualifies via the non-ARI path. Steady state at 10k domains therefore costs 0 orders/week against the cap, not the ~1,167 you would otherwise compute. (2) The per-registered-domain limit (50 per 7 days) does not bind either — distinct registered domains, one cert each. The ticket was already right to warn off W273's number, which is a third limit again (5 per exact identifier set per 7 days).")
+//! @yah:handoff("WHAT WOULD RE-OPEN THIS, so the next reader does not have to re-derive the threshold: sustained demand above ~16,800 NEW registered domains per week, or a decision that the initial fill must complete in under ~4.2 days. Neither is true today — projected volume is zero, since the demux is not yet on :443 (R853-T2 in review). The filing trigger this ticket was opened with ('file once projected volume approaches ~2k/day') never fired.")
+//! @yah:verify("Limits read live 2026-09-05 from https://letsencrypt.org/docs/rate-limits/ (HTTP 200), not from memory: 'Up to 300 new orders can be created by a single account every 3 hours. The ability to create new orders refills at a rate of 1 order every 36 seconds.' The 36s refill matches DomainIssuerConfig::min_order_interval (domain_issuer.rs:94) exactly, so the shipped pacing already tracks the published refill rate.")
+//! @yah:verify("The form URL was confirmed by following the docs page's OWN 'request an override' link rather than asserting a remembered address — the only override/formstack href on the page resolves to https://isrg.formstack.com/forms/rate_limit_adjustment_request (HTTP 200).")
+//! @yah:verify("Renewal exemption quoted from the page's 'Limit Exemptions for Renewals' section verbatim, and our path checked against it: instant-acme 0.8.5 (oss/passway/Cargo.lock:1358) with no ARI usage anywhere (grepped for renewal_info / replaces — zero hits), so we ride the non-ARI exact-identifier-set exemption, which covers the two limits that matter here.")
+//! @yah:verify("The 10k-are-distinct-registered-domains premise — which the whole arithmetic turns on — grounded in W267:3007 ('the 10k-certs problem is inherently about custom tenant domains'), not assumed from the ticket title.")
+//! @yah:gotcha("FORM FIELD WITH NO CORRECT ANSWER, if this is ever revived: 'What ACME client do you use?' is a required dropdown with no free-text escape. All 179 form labels checked — no instant-acme, no rustls-acme, nothing Rust, and no 'Other'. Ours is instant-acme 0.8.5 wrapped in our own acme-engine crate. Closest is the literally-named 'Yet another ACME client' entry, plus a disambiguating sentence in the free-text box.")
+//! @yah:gotcha("THE LIMIT THAT CAN STILL BITE IS A DIFFERENT ONE, and no override exists for it. New Certificates per Exact Set of Identifiers is 5 per 7 days and letsencrypt.org states outright 'We do not offer overrides for this limit.' Non-ARI renewal exemption requires the EXACT same identifier set, so the FLEET wildcard — [yah.dev, *.yah.dev] + YUBABA_ACME_EXTRA_DOMAINS — leaves the exemption the moment that list is widened: the order stops counting as a renewal, consumes New Orders budget, and falls under the 5-per-7-days bucket for its new set. Widening the fleet SAN list more than 5 times in a week will be refused no matter what account-level override exists. That interacts directly with R853-B9, which is what makes widening that list actually take effect.")
+//! @yah:handoff("DRAFT DELETED 2026-09-05 on operator instruction — 'if we need a rate-limit request someday that's fine, but we can write it when we need it.' The right call: the numbers were read off a page stamped 'Last updated: August 5, 2026' and LE moves them, so a parked draft would have rotted into a confidently-wrong form submission. Everything durable is on THIS ticket — the arithmetic, the renewal-exemption finding, the non-overridable exact-set limit, and the ACME-client dropdown trap are all in the handoff/verify/gotcha entries here. What was thrown away was only the paste-ready prose, which is cheap to rewrite and should be rewritten against freshly-read limits anyway.")
+//! @yah:handoff("IF YOU DO REVIVE IT, the recipe rather than the artifact: form is https://isrg.formstack.com/forms/rate_limit_adjustment_request (confirmed by following the 'request an override' link on https://letsencrypt.org/docs/rate-limits/ rather than from memory). Its fields are JS-rendered — curl the form and parse the embedded JSON `label` keys to enumerate them; there were 179 on 2026-09-05. Answer 'No, I am proactively reaching out', override axis 'New Orders', apply to 'Account ID' (not Domains — the 10k are distinct registered domains and the form caps that field at three). The Account ID is the ACME account URI, which is not in this repo: it is created at runtime by load_or_create_account (acme-engine/src/lib.rs) and cached at YUBABA_ACME_ACCOUNT_CACHE on the fleet, so read it off a voter.")
 //!
 //! @yah:ticket(R853-F4, "External Account Binding in acme-engine, so a second CA can absorb order overflow")
 //! @yah:at(2026-09-03T06:34:51Z)
@@ -62,6 +78,11 @@
 //! @yah:depends_on(R853-T3)
 //! @yah:next("CONDITIONAL — build this ONLY if R853-T3 comes back refused. ZeroSSL and Google Trust Services both require External Account Binding, and acme-engine has none: confirmed by grep, there is no EAB code anywhere in the crate. The hook is instant-acme's NewAccount ExternalAccountKey, applied in load_or_create_account (oss/passway/crates/acme-engine/src/lib.rs) alongside the directory_root_cert fork R779 P8 added there.")
 //! @yah:next("THE STORAGE LAYOUT ALREADY ACCOMMODATES A SECOND CA — do not redesign it. Cert objects live at certs/&lt;issuer&gt;/&lt;domain&gt;/{cert.sealed,key.sealed,issuing}, where issuer is the ACME directory host (mirroring certmagic's certificates/&lt;issuer-key&gt;/&lt;domain&gt;/), so adding a CA is a write and not a migration. The ENROLLMENT set lives at enrolled/&lt;domain&gt;, deliberately OUTSIDE certs/&lt;issuer&gt;/, because enrolment is a fact about a tenant rather than about a CA — so a domain stays routable while its cert moves between CAs. See oss/yubaba/crates/yubaba/src/cert_store.rs.")
+//! @yah:gotcha("YOUR TRIGGER GOT LESS LIKELY, 2026-09-05 — read R853-T3 before starting. This ticket fires only if T3's rate-limit request comes back REFUSED, and the live numbers say the request may not need filing at all: New Orders per Account is 300/3h = 16,800/week, the fill is 10,000 orders (distinct registered domains, one identifier each), so it fits under the DEFAULT limit with 40% headroom. Renewals additionally draw ZERO from that budget — LE exempts both ARI and exact-identifier-set renewals from New Orders per Account. So the overflow-to-a-second-CA scenario this ticket exists to serve has no arithmetic behind it today. Do NOT start building EAB on a schedule; wait for an actual refusal, or for the domain target to move well past ~16.8k/week.")
+//! @yah:gotcha("IF IT DOES FIRE, one constraint the ticket does not mention: the New Certificates per Exact Set of Identifiers limit (5 per 7 days) is explicitly NON-overridable — 'We do not offer overrides for this limit' on letsencrypt.org, checked 2026-09-05. So a second CA is the only remedy for that particular limit, which is the one that bites when the FLEET wildcard's SAN list is widened repeatedly (see R853-T3's gotcha on the B9 interaction). That is a genuinely different motivation for EAB than order-volume overflow, and a stronger one.")
+//! @yah:next("TRIGGER IS NOW DEAD, 2026-09-05 — do not build this on the rationale it was filed with. This ticket's condition is 'build ONLY if R853-T3 comes back refused'. T3 is settled as NOT FILED (operator decision): the New Orders per Account limit does not bind on the 10k fill — 300/3h = 16,800/week against a 10,000-order fill, with renewals exempt entirely — so there is no request to be refused and the order-overflow scenario has no arithmetic behind it. Left open rather than closed because a DIFFERENT and stronger motivation surfaced while settling T3; that motivation is below, and whoever picks this up should re-file the justification around it rather than inherit the overflow framing.")
+//! @yah:next("THE MOTIVATION THAT SURVIVES is the New Certificates per Exact Set of Identifiers limit: 5 per 7 days, and letsencrypt.org states 'We do not offer overrides for this limit.' A second CA is therefore the ONLY remedy for it — unlike order volume, this one cannot be procured around at any price. It binds on the FLEET wildcard, whose identifier set is [yah.dev, *.yah.dev] + YUBABA_ACME_EXTRA_DOMAINS: widening that list leaves the non-ARI renewal exemption, so more than 5 widenings in a week gets refused outright. Whether that is worth EAB depends on how often the fleet SAN list actually changes, which is an operator question and not currently answerable — the fleet issuer has never issued (see R853-B9's gotcha: it is inert until R858-T3 makes raft leadership movable).")
+//! @yah:next("CHEAPER ALTERNATIVE TO WEIGH FIRST, if the exact-set limit is the real driver: adopt ARI in acme-engine instead of EAB. instant-acme 0.8.5 is already the dependency and we use no ARI today (grepped: no renewal_info / replaces anywhere). ARI renewals are exempt from ALL rate limits including the exact-set one, where non-ARI renewals are not. That is a smaller change than a second CA with external account binding, keeps one issuer, and does not touch the cert-store issuer axis at all. It does NOT help with a genuinely new identifier set — a first-ever widening is not a renewal under either scheme — so it narrows the problem rather than removing it.")
 
 use std::collections::HashMap;
 use std::io;
@@ -304,12 +325,179 @@ impl From<io::Error> for AcmeError {
 // Renewal-due decision (pure)
 // ---------------------------------------------------------------------------
 
-/// Pure decision: given a cert `issued_at`, a fixed validity `lifetime`,
-/// and a `renew_before` safety margin, is a cert due for renewal at `now`?
-pub fn is_renewal_due(issued_at: SystemTime, lifetime: Duration, renew_before: Duration, now: SystemTime) -> bool {
+/// What the caller knows about the SAN set of the cert it is currently
+/// holding — the input [`renewal_decision`] needs in order to answer
+/// "is this the *right* cert", not merely "is it old".
+///
+/// This is an enum rather than an `Option` so that deciding on age alone
+/// cannot be written by accident. Age-only is sometimes genuinely correct,
+/// but it is also exactly what produced R853-B7/B8: widening a configured
+/// domain list left a fresh-but-narrower cert in place for up to
+/// `lifetime - renew_before`, silently, with the config file reading as
+/// though the change had taken effect. Naming the choice forces every call
+/// site to make it out loud, and makes the age-only ones greppable.
+pub enum CertSans<'a> {
+    /// The leaf's `dNSName` set, as returned by [`cert_dns_names`].
+    Known(&'a [String]),
+    /// A cert is stored but is not one this process can parse — it could not
+    /// serve those bytes either, so they must be replaced.
+    Unreadable,
+    /// The caller deliberately did not look. Only age decides. Every use owes
+    /// a comment at the call site saying why the configured name list cannot
+    /// widen underneath it — or which ticket is going to close that gap.
+    NotChecked,
+}
+
+/// Why (or why not) a stored cert should be reordered now. Carries the reason
+/// rather than a bare `bool` so the caller can name the missing SANs back to
+/// an operator instead of logging an unexplained reissue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenewalDecision {
+    /// Covers every configured name and is outside its renewal margin.
+    Fresh,
+    /// Inside the `renew_before` margin, or already expired.
+    DueForAge,
+    /// Does not cover these configured names, whatever its age. Order and
+    /// duplicates are as the operator wrote them in config.
+    DueForCoverage(Vec<String>),
+    /// Stored, but not parseable as a certificate.
+    DueUnreadable,
+}
+
+impl RenewalDecision {
+    pub fn is_due(&self) -> bool {
+        !matches!(self, RenewalDecision::Fresh)
+    }
+}
+
+/// Pure decision: should the cert described by `sans` / `issued_at` be
+/// reordered at `now`, given the `wanted` domain list, a fixed validity
+/// `lifetime` and a `renew_before` safety margin?
+///
+/// Coverage is checked **before** age, because a cert can be minutes old and
+/// still be the wrong cert; see [`domains_not_covered`] for the RFC 6125
+/// matching rule. `wanted` is ignored when `sans` is not [`CertSans::Known`].
+pub fn renewal_decision(
+    sans: CertSans<'_>,
+    wanted: &[String],
+    issued_at: SystemTime,
+    lifetime: Duration,
+    renew_before: Duration,
+    now: SystemTime,
+) -> RenewalDecision {
+    match sans {
+        CertSans::Unreadable => return RenewalDecision::DueUnreadable,
+        CertSans::Known(have) => {
+            let missing = domains_not_covered(have, wanted);
+            if !missing.is_empty() {
+                return RenewalDecision::DueForCoverage(missing);
+            }
+        }
+        CertSans::NotChecked => {}
+    }
+
+    if is_renewal_due(issued_at, lifetime, renew_before, now) {
+        RenewalDecision::DueForAge
+    } else {
+        RenewalDecision::Fresh
+    }
+}
+
+/// The age half of [`renewal_decision`]. Deliberately **not** `pub`: reachable
+/// only through `renewal_decision`, so a new call site cannot decide renewal
+/// from age alone without saying [`CertSans::NotChecked`] where a reviewer
+/// will see it.
+fn is_renewal_due(issued_at: SystemTime, lifetime: Duration, renew_before: Duration, now: SystemTime) -> bool {
     let expires_at = issued_at.checked_add(lifetime).unwrap_or(issued_at);
     let renew_at = expires_at.checked_sub(renew_before).unwrap_or(issued_at);
     now >= renew_at
+}
+
+/// The `dNSName` SANs carried by the **leaf** (first) certificate of a PEM
+/// chain, ASCII-lowercased and with any trailing root dot trimmed.
+///
+/// `None` means "this file is not a certificate we can read" — an empty PEM,
+/// a truncated one, a key mistakenly written to the cert path, or a DER
+/// structure `x509-parser` rejects. Callers should treat `None` as *reissue*,
+/// never as *no names*: an unparseable cert is one this process also cannot
+/// serve, and returning an empty Vec would make it indistinguishable from a
+/// cert that legitimately carries no SAN.
+///
+/// A cert with no `subjectAltName` extension at all yields `Some(vec![])`.
+/// This deliberately does NOT fall back to the Subject CN: CN-as-hostname has
+/// been deprecated since RFC 2818 and is ignored by every current TLS client,
+/// so honouring it here would report coverage that no browser agrees with.
+pub fn cert_dns_names(cert_chain_pem: &str) -> Option<Vec<String>> {
+    let (_, pem) = x509_parser::pem::parse_x509_pem(cert_chain_pem.as_bytes()).ok()?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&pem.contents).ok()?;
+    let mut names = Vec::new();
+    // `subject_alternative_name()` is Ok(None) when the extension is absent
+    // and Err(..) only when it is present but malformed — the latter is a
+    // broken cert, so it joins the `None` (reissue) path rather than being
+    // read as "no names".
+    if let Some(san) = cert.subject_alternative_name().ok()? {
+        for general_name in &san.value.general_names {
+            if let x509_parser::extensions::GeneralName::DNSName(name) = general_name {
+                names.push(normalize_dns_name(name));
+            }
+        }
+    }
+    Some(names)
+}
+
+/// Which of `wanted` the SAN set `have` does **not** cover — empty means the
+/// cert on disk already satisfies the configured domain list.
+///
+/// Matching follows RFC 6125 as a TLS client would apply it, because the
+/// question this answers is "would a client asking for these names accept the
+/// cert we are serving?":
+///
+/// - exact match, case-insensitively;
+/// - a `*.example.com` SAN covers exactly one additional label
+///   (`www.example.com`), NOT the apex (`example.com`) and NOT a deeper name
+///   (`a.b.example.com`).
+///
+/// Order and duplicates in `wanted` are preserved in the result so the caller
+/// can name the missing entries back to an operator exactly as they wrote
+/// them in config.
+pub fn domains_not_covered(have: &[String], wanted: &[String]) -> Vec<String> {
+    // Both sides are normalized here rather than trusted: `have` usually
+    // comes from `cert_dns_names` (already normalized) but this is public and
+    // an operator's config list certainly is not, and comparing raw strings
+    // would re-order a good cert forever over a capital letter.
+    let have: Vec<String> = have.iter().map(|san| normalize_dns_name(san)).collect();
+    wanted
+        .iter()
+        .filter(|want| {
+            let normalized = normalize_dns_name(want);
+            !have.iter().any(|san| dns_name_covers(san, &normalized))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Lowercase and drop a trailing root dot, so `WWW.Yah.dev.` and
+/// `www.yah.dev` compare equal.
+fn normalize_dns_name(name: &str) -> String {
+    name.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Does the (already normalized) SAN `have` cover the (already normalized)
+/// name `want`? See [`domains_not_covered`] for the rules.
+fn dns_name_covers(have: &str, want: &str) -> bool {
+    if have == want {
+        return true;
+    }
+    let Some(suffix) = have.strip_prefix("*.") else {
+        return false;
+    };
+    // The wildcard label must not be empty and must not itself contain a dot,
+    // so `*.yah.dev` covers `www.yah.dev` but neither `yah.dev` nor
+    // `a.b.yah.dev` nor `*.a.yah.dev`.
+    match want.strip_suffix(suffix).and_then(|head| head.strip_suffix('.')) {
+        Some(label) => !label.is_empty() && !label.contains('.'),
+        None => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -733,6 +921,112 @@ pub async fn issue(config: &IssueConfig, tokens: &ChallengeTokens) -> Result<Iss
 mod tests {
     use super::*;
 
+    // -- domains_not_covered / dns_name_covers (pure) -------------------
+
+    fn owned(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// R853-B7's actual production shape: us-south-001 served an apex-only
+    /// cert while the config asked for the wildcard too, so every yah.dev
+    /// SUBDOMAIN failed on that node. Age says "fine"; coverage says "no".
+    #[test]
+    fn an_apex_only_cert_does_not_cover_a_widened_wildcard_config() {
+        assert_eq!(
+            domains_not_covered(&owned(&["yah.dev"]), &owned(&["*.yah.dev", "yah.dev"])),
+            owned(&["*.yah.dev"])
+        );
+    }
+
+    #[test]
+    fn a_cert_carrying_every_configured_name_is_fully_covered() {
+        assert!(domains_not_covered(&owned(&["yah.dev", "*.yah.dev"]), &owned(&["*.yah.dev", "yah.dev"])).is_empty());
+    }
+
+    /// A wildcard SAN covers exactly one extra label — the RFC 6125 rule a
+    /// TLS client applies. Getting this wrong in either direction is
+    /// expensive: too strict re-orders a cert that already works (burning
+    /// the account's order budget), too loose leaves the B8 bug in place for
+    /// the deeper name.
+    #[test]
+    fn a_wildcard_covers_one_label_and_neither_the_apex_nor_a_deeper_name() {
+        let have = owned(&["*.yah.dev"]);
+        assert!(domains_not_covered(&have, &owned(&["www.yah.dev"])).is_empty());
+        assert_eq!(domains_not_covered(&have, &owned(&["yah.dev"])), owned(&["yah.dev"]));
+        assert_eq!(domains_not_covered(&have, &owned(&["a.b.yah.dev"])), owned(&["a.b.yah.dev"]));
+        assert_eq!(domains_not_covered(&have, &owned(&["*.a.yah.dev"])), owned(&["*.a.yah.dev"]));
+        // The wildcard label may not be empty: `*.yah.dev` is not a cert for
+        // `.yah.dev`.
+        assert_eq!(domains_not_covered(&have, &owned([".yah.dev"].as_slice())), owned(&[".yah.dev"]));
+    }
+
+    /// A wildcard in the CONFIG needs a wildcard in the cert — a bag of
+    /// specific SANs does not add up to one. Without this, widening config
+    /// to `*.yah.dev` while the cert holds `www.yah.dev` would read as
+    /// covered and reproduce B8.
+    #[test]
+    fn specific_sans_do_not_satisfy_a_wildcard_request() {
+        assert_eq!(
+            domains_not_covered(&owned(&["www.yah.dev", "api.yah.dev"]), &owned(&["*.yah.dev"])),
+            owned(&["*.yah.dev"])
+        );
+    }
+
+    /// DNS names are case-insensitive and a trailing root dot is not a
+    /// difference. Comparing raw strings would re-order a perfectly good
+    /// cert on every check — a slow rate-limit burn that only shows up in
+    /// production, where a CA hands back mixed-case or rooted names.
+    #[test]
+    fn matching_ignores_case_and_a_trailing_root_dot() {
+        assert!(domains_not_covered(&owned(&["YAH.dev.", "*.YAH.dev"]), &owned(&["yah.dev", "www.yah.dev."])).is_empty());
+    }
+
+    #[test]
+    fn an_empty_config_is_covered_by_anything_and_an_empty_cert_covers_nothing() {
+        assert!(domains_not_covered(&owned(&["yah.dev"]), &[]).is_empty());
+        assert_eq!(domains_not_covered(&[], &owned(&["yah.dev"])), owned(&["yah.dev"]));
+    }
+
+    // -- cert_dns_names -------------------------------------------------
+
+    /// The `None` contract is the load-bearing half: callers treat it as
+    /// "reissue", so it must not be reachable for a cert that merely has no
+    /// SANs (that is `Some(vec![])`), and must be reachable for anything
+    /// that is not a readable certificate.
+    #[test]
+    fn unreadable_cert_material_is_none_not_an_empty_name_set() {
+        assert!(cert_dns_names("").is_none());
+        assert!(cert_dns_names("-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n").is_none());
+        assert!(cert_dns_names("-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n").is_none());
+    }
+
+    /// Round-trip through a real DER encoder rather than a checked-in
+    /// fixture, so the assertion is about what an X.509 cert actually says
+    /// and cannot rot into agreeing with a hand-written blob.
+    fn self_signed_pem(names: &[&str]) -> String {
+        let rcgen::CertifiedKey { cert, .. } =
+            rcgen::generate_simple_self_signed(names.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .expect("self-signed leaf");
+        cert.pem()
+    }
+
+    #[test]
+    fn reads_the_san_set_off_a_real_certificate() {
+        let names = cert_dns_names(&self_signed_pem(&["yah.dev", "*.yah.dev"])).expect("a self-signed cert parses");
+        assert!(domains_not_covered(&names, &owned(&["yah.dev", "www.yah.dev"])).is_empty());
+        assert_eq!(domains_not_covered(&names, &owned(&["other.test"])), owned(&["other.test"]));
+    }
+
+    /// The leaf is the cert a client checks, and it is first in the chain —
+    /// a chain whose intermediate carries different names must still report
+    /// the leaf's.
+    #[test]
+    fn reads_the_leaf_when_the_file_is_a_chain() {
+        let leaf = self_signed_pem(&["leaf.test"]);
+        let issuer = self_signed_pem(&["issuer.test"]);
+        assert_eq!(cert_dns_names(&format!("{leaf}{issuer}")).expect("chain parses"), owned(&["leaf.test"]));
+    }
+
     // -- is_renewal_due (pure) -----------------------------------------
 
     #[test]
@@ -765,6 +1059,66 @@ mod tests {
         let now = SystemTime::now();
         let issued_at = now - Duration::from_secs(100 * 86_400);
         assert!(is_renewal_due(issued_at, Duration::from_secs(90 * 86_400), Duration::from_secs(30 * 86_400), now));
+    }
+
+    // -- renewal_decision (pure) ----------------------------------------
+
+    const LIFETIME: Duration = Duration::from_secs(90 * 86_400);
+    const RENEW_BEFORE: Duration = Duration::from_secs(30 * 86_400);
+
+    fn decide(sans: CertSans<'_>, wanted: &[&str], age_days: u64) -> RenewalDecision {
+        let now = SystemTime::now();
+        let issued_at = now - Duration::from_secs(age_days * 86_400);
+        renewal_decision(sans, &owned(wanted), issued_at, LIFETIME, RENEW_BEFORE, now)
+    }
+
+    #[test]
+    fn not_checked_falls_back_to_age_alone() {
+        assert_eq!(decide(CertSans::NotChecked, &["yah.dev"], 1), RenewalDecision::Fresh);
+        assert_eq!(decide(CertSans::NotChecked, &["yah.dev"], 61), RenewalDecision::DueForAge);
+    }
+
+    /// The whole point of the seam: `NotChecked` must ignore `wanted` rather
+    /// than quietly reporting coverage it never looked at.
+    #[test]
+    fn not_checked_ignores_the_wanted_list_entirely() {
+        assert_eq!(decide(CertSans::NotChecked, &["never.covered.example"], 1), RenewalDecision::Fresh);
+    }
+
+    #[test]
+    fn a_covering_cert_is_fresh_until_its_age_window_opens() {
+        let have = owned(&["*.yah.dev", "yah.dev"]);
+        assert_eq!(decide(CertSans::Known(&have), &["www.yah.dev", "yah.dev"], 1), RenewalDecision::Fresh);
+        assert_eq!(decide(CertSans::Known(&have), &["www.yah.dev"], 61), RenewalDecision::DueForAge);
+    }
+
+    /// R853-B8: a brand-new cert that does not cover a widened config is due
+    /// NOW, and the decision names what is missing.
+    #[test]
+    fn coverage_is_checked_before_age_and_names_the_missing_domains() {
+        let have = owned(&["yah.dev"]);
+        assert_eq!(
+            decide(CertSans::Known(&have), &["yah.dev", "cloud.mesh.yah.dev"], 1),
+            RenewalDecision::DueForCoverage(owned(&["cloud.mesh.yah.dev"]))
+        );
+        // Old AND uncovered reports coverage, so the log says the useful thing.
+        assert_eq!(
+            decide(CertSans::Known(&have), &["cloud.mesh.yah.dev"], 61),
+            RenewalDecision::DueForCoverage(owned(&["cloud.mesh.yah.dev"]))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_cert_is_due_however_fresh_it_is() {
+        assert_eq!(decide(CertSans::Unreadable, &["yah.dev"], 0), RenewalDecision::DueUnreadable);
+    }
+
+    #[test]
+    fn only_fresh_is_not_due() {
+        assert!(!RenewalDecision::Fresh.is_due());
+        assert!(RenewalDecision::DueForAge.is_due());
+        assert!(RenewalDecision::DueForCoverage(owned(&["yah.dev"])).is_due());
+        assert!(RenewalDecision::DueUnreadable.is_due());
     }
 
     // -- write_file_atomic round trip -----------------------------------

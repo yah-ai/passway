@@ -1,0 +1,21 @@
+# Detached from the passway workspace on purpose. Without this empty
+# [workspace] table, cargo walks up, finds oss/passway/Cargo.toml, sees this
+# package is not in its `members`, and refuses to build anything in here.
+[workspace]
+
+[package]
+name = "fdspike"
+version = "0.8.33"
+edition = "2021"
+publish = false
+
+# R853-S5: STOCK crates.io pingora-core. No [patch.crates-io], no fork.
+# The whole point of the spike is that this resolves to the published 0.8.1
+# that has no `Server::seed_listen_fd`.
+[dependencies]
+pingora-core = "0.8.1"
+async-trait = "0.1"
+http = "1"
+env_logger = "0.11"
+log = "0.4"
+libc = "0.2"

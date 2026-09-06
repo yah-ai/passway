@@ -45,6 +45,14 @@ log = "0.4"
 # this engine's.
 tokio = { version = "1", features = ["sync", "time"] }
 
+# R853-B8 — `cert_dns_names` reads the SAN set off the cert already on disk so
+# a renewal can be driven by COVERAGE, not just by age. Parsing only, no
+# verification and no crypto: this crate never validates a chain, it asks
+# "which names does this file claim". MIT OR Apache-2.0, already in this
+# workspace's graph (it arrived as the R779-P8 Pebble test's dev-dep, and this
+# promotes it to a real dependency rather than adding a new one).
+x509-parser = "0.18"
+
 # R779-P8 — only the DNS-01 delegation integration test
 # (`tests/pebble_dns01_delegation.rs`) needs these; none reaches the library.
 # Real versions, never `"*"`: `deny.toml` sets `bans.wildcards = "deny"`.
@@ -64,6 +72,9 @@ serde_json = "1"
 # Holds Pebble's fetched root PEM for the life of the test — the path handed
 # to `IssueConfig::directory_root_cert`.
 tempfile = "3"
-# Parses the issued chain to assert the leaf actually carries the identifier.
-# Already in this workspace's graph; MIT OR Apache-2.0.
-x509-parser = "0.18"
+# R853-B8 — mints self-signed certs so the `cert_dns_names` tests assert
+# against a real DER encoding rather than a checked-in fixture that could rot
+# into agreeing with a hand-written blob. Already a direct dep of the
+# `passway` crate at the same version, and reached here anyway through
+# instant-acme's `rcgen` feature.
+rcgen = "0.14"

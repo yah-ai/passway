@@ -7,7 +7,7 @@
 //! "passway's backend set follows placement" is proven end to end rather than
 //! asserted.
 //!
-//! Three behaviours, the last two being the ones that decide whether this is
+//! Six behaviours, the ones after the first being what decides whether this is
 //! safe to put in front of public traffic:
 //!
 //!   1. A record published by yubaba becomes a routable upstream, with no
@@ -18,6 +18,12 @@
 //!      fail-ready-503s rather than routing into a black hole.
 //!   4. Only the fronted workload's records become backends — a sibling
 //!      workload on the same node does not (R844-B6).
+//!   5. A workload placed on N nodes is polled from N yubabas and served as
+//!      the **union** of their records (R844-F23) — the record store is
+//!      node-local, so one poll can only ever see one node's share.
+//!   6. That union holds **per source**: one node's yubaba failing leaves that
+//!      node's last-known-good backends in the set beside its peers' fresh
+//!      ones. Rule 2 applied to one node rather than to the whole door.
 //!
 //! ```bash
 //! cargo test --test main yubaba_discovery::
@@ -132,8 +138,14 @@ async fn wait_for_ready(client: &reqwest::Client, base: &str, want_ready: u64) {
 }
 
 fn discovery_source(yubaba: SocketAddr) -> Arc<YubabaUpstreams> {
+    discovery_sources(&[yubaba])
+}
+
+/// The R844-F23 shape: one source, N polled yubabas — one per node the fronted
+/// workload is placed on.
+fn discovery_sources(yubabas: &[SocketAddr]) -> Arc<YubabaUpstreams> {
     Arc::new(YubabaUpstreams::new(&YubabaDiscoveryConfig {
-        base_url: format!("http://{yubaba}"),
+        base_urls: yubabas.iter().map(|y| format!("http://{y}")).collect(),
         ident: "marketing".to_string(),
         timeout: Duration::from_secs(2),
     }))
@@ -277,5 +289,88 @@ async fn an_authoritative_empty_answer_drains_and_fails_ready() {
         resp.status(),
         503,
         "no upstreams must fail ready (503), never crash or hang"
+    );
+}
+
+/// R844-F23, end to end: a workload placed on TWO nodes has its records split
+/// across two node-local stores (R844-B11), so the door polls both and serves
+/// the union. Proven through the real `LoadBalancer` and `TcpHealthCheck`
+/// rather than at the `addrs()` boundary — the claim is "both nodes' containers
+/// receive traffic", not "both addresses appear in a Vec".
+#[tokio::test]
+async fn records_from_two_yubabas_both_become_routable_upstreams() {
+    let east_backend = common::spawn_fake_upstream("east").await;
+    let west_backend = common::spawn_fake_upstream("west").await;
+    let east = spawn_fake_yubaba(Arc::new(Mutex::new((200, ready_body(east_backend))))).await;
+    let west = spawn_fake_yubaba(Arc::new(Mutex::new((200, ready_body(west_backend))))).await;
+
+    let (proxy, lb_background) = common::build_proxy_with_source(discovery_sources(&[east, west]));
+    let listen = common::free_addr();
+    common::start_proxy(proxy, lb_background, listen);
+
+    let client = reqwest::Client::new();
+    let base = format!("http://{listen}");
+    // TWO ready upstreams from two separate polls — one would mean the union
+    // collapsed to whichever node answered first.
+    wait_for_ready(&client, &base, 2).await;
+
+    let mut tags = std::collections::BTreeSet::new();
+    for _ in 0..6 {
+        let resp = client.get(format!("{base}/")).send().await.expect("request to proxy");
+        assert_eq!(resp.status(), 200);
+        tags.insert(
+            resp.headers()["x-upstream-tag"]
+                .to_str()
+                .expect("tag is ascii")
+                .to_string(),
+        );
+    }
+    assert_eq!(
+        tags,
+        ["east".to_string(), "west".to_string()].into_iter().collect(),
+        "round-robin must reach BOTH placement nodes' containers: {tags:?}"
+    );
+}
+
+/// The per-source hold rule (R594-F8 scoped per node by R844-F23), end to end.
+/// One node's yubaba starts failing while the other keeps answering: the door
+/// must still serve both nodes' containers. Collapsing to the healthy node
+/// alone is a half-fleet outage caused by a control-plane blip, which is
+/// precisely what the hold rule exists to prevent.
+#[tokio::test]
+async fn one_yubaba_failing_does_not_drain_that_nodes_upstreams() {
+    let east_backend = common::spawn_fake_upstream("east").await;
+    let west_backend = common::spawn_fake_upstream("west").await;
+    let east_answer: Answer = Arc::new(Mutex::new((200, ready_body(east_backend))));
+    let east = spawn_fake_yubaba(Arc::clone(&east_answer)).await;
+    let west = spawn_fake_yubaba(Arc::new(Mutex::new((200, ready_body(west_backend))))).await;
+
+    let (proxy, lb_background) = common::build_proxy_with_source(discovery_sources(&[east, west]));
+    let listen = common::free_addr();
+    common::start_proxy(proxy, lb_background, listen);
+
+    let client = reqwest::Client::new();
+    let base = format!("http://{listen}");
+    wait_for_ready(&client, &base, 2).await;
+
+    // East's yubaba goes away. Several discovery ticks (100ms each) go by.
+    *east_answer.lock().unwrap() = (500, r#"{"error":"raft unavailable"}"#.to_string());
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let mut tags = std::collections::BTreeSet::new();
+    for _ in 0..6 {
+        let resp = client.get(format!("{base}/")).send().await.expect("request to proxy");
+        assert_eq!(resp.status(), 200);
+        tags.insert(
+            resp.headers()["x-upstream-tag"]
+                .to_str()
+                .expect("tag is ascii")
+                .to_string(),
+        );
+    }
+    assert_eq!(
+        tags,
+        ["east".to_string(), "west".to_string()].into_iter().collect(),
+        "east's held set must survive east's yubaba being unreachable: {tags:?}"
     );
 }

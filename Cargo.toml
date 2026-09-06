@@ -13,19 +13,31 @@
 members = ["crates/passway", "crates/acme-engine", "crates/sni-demux"]
 resolver = "2"
 
-# R779 — carried pingora fork. `Server::seed_listen_fd(bind, fd)` lets passway
-# adopt an already-listening socket handed in as fd 3 (systemd LISTEN_FDS /
-# kamaji's on-demand JIT tier); crates.io pingora 0.8.1 has no such API and its
-# only fd-inheritance path is its own SCM_RIGHTS upgrade protocol. The fork is
-# tag 0.8.1 + patches/pingora-0.8.1-seed-listen-fds.patch and is a WAITING ROOM:
-# drop this block once the same three hunks land upstream in cloudflare/pingora.
+# R853-F6 (2026-09-04): the carried pingora fork is GONE. passway used to pin
+# all 14 pingora crates to github.com/yah-ai/pingora for one added API,
+# `Server::seed_listen_fd`. It now hands the inherited socket to its own server
+# over pingora's existing upgrade socket instead — the only public seam into
+# pingora's fd table — so stock crates.io pingora is enough. See
+# crates/passway/src/socket_activation.rs and the standalone proof in
+# spikes/R853-S5-upgrade-socket-handoff/.
 #
-# ALL 14 pingora crates in the graph must be patched, not just pingora-core —
-# patching one duplicates pingora-error / pingora-http (registry vs fork) and
-# the types stop unifying (E0308 everywhere). Pinned by `rev`, never `branch`:
-# a moving branch in a [patch] block makes the build non-reproducible.
+# R853-T1 (2026-09-05): the `patches/` directory is GONE too, by operator
+# decision — with the fork deleted there is nothing left to upstream on our own
+# behalf. History is at `git show be2680f4:oss/passway/patches/`.
+#
+# For the record, since the shape of this invites the wrong conclusion: the fork
+# was NOT taken on bad information. W267 weighed this exact upgrade-socket route
+# on 2026-08-28 and rejected it ("works; points the wrong way"). It was reversed
+# on evidence that arrived later — R853-S5 proved the rejected route sound, and
+# `[patch.crates-io]`'s non-propagation to published crates turned out to cost
+# more than the fork was worth. See crates/passway/src/socket_activation.rs.
+#
+# Do NOT reintroduce a [patch.crates-io] block here without reading that: it
+# does not propagate to consumers, so it silently breaks `cargo install passway`
+# for everyone on crates.io while working fine in this monorepo.
+
 [workspace.package]
-version = "0.8.32"
+version = "0.8.33"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"

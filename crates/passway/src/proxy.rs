@@ -47,7 +47,7 @@ use crate::hardening;
 use crate::health::{HostReadiness, ReadinessBody};
 use crate::host::{self, HostOutcome};
 use crate::idle::IdleTracker;
-use crate::routing::HostRouter;
+use crate::routing::{HostRouter, UpstreamOpts};
 use crate::upstream;
 
 /// Per-request state. Carries the upstream set
@@ -55,9 +55,15 @@ use crate::upstream;
 /// authority through to [`upstream_peer`](PassProxy::upstream_peer), so both
 /// phases act on the same set — re-deriving the host in `upstream_peer` would
 /// be a second chance to disagree with the readiness gate that already ran.
+///
+/// R858-T1 extends that property to *how* the set is reached: the resolved
+/// [`UpstreamOpts`] ride along too, so `upstream_peer` never has to look a
+/// second thing up by host and never has to reconcile a per-set scheme with a
+/// process-wide one.
 #[derive(Default)]
 pub struct RequestCtx {
     upstreams: Option<Arc<LoadBalancer<RoundRobin>>>,
+    upstream_opts: Option<UpstreamOpts>,
 }
 
 /// The passway proxy. Construct via [`PassProxy::new`] (one upstream set for
@@ -118,14 +124,27 @@ impl PassProxy {
         self
     }
 
-    /// Whether to speak TLS to the upstream and, if so, which SNI to
-    /// present. Defaults to plaintext: upstreams are reached over the
+    /// The DEFAULT for whether to speak TLS to the upstream and, if so, which
+    /// SNI to present. Defaults to plaintext: upstreams are reached over the
     /// already-encrypted WireGuard mesh (W267 §Design), so upstream TLS is
     /// an optional extra layer, not the primary confidentiality boundary.
+    ///
+    /// R858-T1: this is now the fallback for any set that declares no
+    /// [`UpstreamOpts`] of its own (`PASSWAY_UPSTREAM_TLS=true`, the bare
+    /// process-wide form). A set that does declare one wins — see
+    /// [`crate::routing`].
     pub fn with_upstream_tls(mut self, tls: bool, sni: impl Into<String>) -> Self {
         self.upstream_tls = tls;
         self.upstream_sni = sni.into();
         self
+    }
+
+    /// The upstream scheme applied to a set that declares none of its own.
+    fn default_upstream_opts(&self) -> UpstreamOpts {
+        UpstreamOpts {
+            tls: self.upstream_tls,
+            sni: self.upstream_sni.clone(),
+        }
     }
 
     /// Override the health-check path (default `/health`).
@@ -227,8 +246,8 @@ impl ProxyHttp for PassProxy {
                 body = body.with_hosts(
                     self.router
                         .sets()
-                        .map(|(label, lb)| {
-                            let (ready_upstreams, total_upstreams) = upstream::ready_count(lb);
+                        .map(|(label, u)| {
+                            let (ready_upstreams, total_upstreams) = upstream::ready_count(&u.lb);
                             HostReadiness {
                                 host: label.to_string(),
                                 ready_upstreams,
@@ -320,7 +339,7 @@ impl ProxyHttp for PassProxy {
         // that serves it has no ready upstreams", and deliberately NOT a
         // fallthrough to some other host's backends. The response body says
         // nothing about which hostnames do exist.
-        let Some(lb) = self.router.resolve(host.as_deref()) else {
+        let Some(upstream) = self.router.resolve(host.as_deref()) else {
             respond_json(
                 session,
                 503,
@@ -334,7 +353,7 @@ impl ProxyHttp for PassProxy {
         // set must 503, never fall through into `upstream_peer` and error
         // out mid-connect. Scoped to the selected set: one host's backends
         // being down never borrows another host's.
-        if !upstream::any_ready(lb) {
+        if !upstream::any_ready(&upstream.lb) {
             respond_json(
                 session,
                 503,
@@ -344,7 +363,16 @@ impl ProxyHttp for PassProxy {
             return Ok(true);
         }
 
-        ctx.upstreams = Some(Arc::clone(lb));
+        ctx.upstreams = Some(Arc::clone(&upstream.lb));
+        // Resolved here, against the set that just passed the readiness gate,
+        // rather than in `upstream_peer` — same reason the balancer itself is
+        // threaded through the ctx (R858-T1).
+        ctx.upstream_opts = Some(
+            upstream
+                .opts
+                .clone()
+                .unwrap_or_else(|| self.default_upstream_opts()),
+        );
         Ok(false)
     }
 
@@ -363,14 +391,18 @@ impl ProxyHttp for PassProxy {
                 "no upstream set on the request context (request_filter did not resolve one)",
             )
         })?;
+        // The scheme for THAT set, resolved in `request_filter` against the
+        // same `HostUpstream`. A ctx without one can only mean the balancer
+        // was set without it, which this file does not do; fall back to the
+        // proxy-wide default rather than inventing a second failure mode.
+        let opts = ctx
+            .upstream_opts
+            .clone()
+            .unwrap_or_else(|| self.default_upstream_opts());
         // `key` doesn't matter for RoundRobin (see pingora's own
         // load_balancer.rs example) — b"" mirrors it verbatim.
         match lb.select(b"", 256) {
-            Some(backend) => Ok(Box::new(HttpPeer::new(
-                backend,
-                self.upstream_tls,
-                self.upstream_sni.clone(),
-            ))),
+            Some(backend) => Ok(Box::new(HttpPeer::new(backend, opts.tls, opts.sni))),
             // request_filter already gated emptiness; reaching here means a
             // backend flipped unhealthy in the race window between the two
             // checks. Fail the same way request_filter would have.

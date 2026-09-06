@@ -32,6 +32,17 @@
 //! The deadlock this catches if it ever regresses: passway binding fresh under a
 //! supervisor that already holds the port, which fails at *runtime* on the
 //! second fork (`EADDRINUSE`) and is invisible to every other test here.
+//!
+//! **Linux-only since R853-F6**, for the same reason as `socket_activation.rs`:
+//! adoption now rides pingora's `SCM_RIGHTS` upgrade protocol, whose helpers
+//! are `#[cfg(target_os = "linux")]` upstream. Off Linux the forked passway
+//! refuses to start at all — deliberately, rather than binding fresh behind the
+//! supervisor's back — so there is nothing here to assert. This test used to
+//! run on the darwin dev machines and no longer does; that lost local coverage
+//! is the accepted cost of dropping the pingora fork, and this repo has no CI
+//! standing behind it.
+
+#![cfg(all(target_os = "linux", feature = "socket-activation"))]
 
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};

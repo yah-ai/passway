@@ -81,10 +81,10 @@
 //!   the still-valid (if aging) cert on disk. This mirrors the crate's
 //!   existing fail-ready posture (R594-F6's cold-start gotcha) rather than
 //!   fail-crash.
-//! - [`acme_engine::is_renewal_due`] — the pure renewal-due decision (cert
-//!   age vs. lifetime vs. renew-before margin), factored out from any I/O
-//!   so it's directly unit-testable; lives in the engine and is wrapped
-//!   here by the disk-checking [`cert_needs_renewal`].
+//! - [`acme_engine::renewal_decision`] — the pure renewal decision (SAN
+//!   coverage first, then cert age vs. lifetime vs. renew-before margin),
+//!   factored out from any I/O so it's directly unit-testable; lives in the
+//!   engine and is wrapped here by the disk-reading [`cert_needs_renewal`].
 
 use std::collections::HashMap;
 use std::io;
@@ -99,7 +99,9 @@ use std::time::{Duration, SystemTime};
 // etc. keep resolving exactly as before the extraction.
 pub use acme_engine::{AcmeChallengeKind, AcmeDirectory, AcmeError};
 // Engine internals this shell drives but doesn't re-expose.
-use acme_engine::{is_renewal_due, write_file_atomic, ChallengeTokens, IssueConfig};
+use acme_engine::{
+    cert_dns_names, renewal_decision, write_file_atomic, CertSans, ChallengeTokens, IssueConfig, RenewalDecision,
+};
 use async_trait::async_trait;
 use pingora::server::ShutdownWatch;
 use pingora::services::background::BackgroundService;
@@ -152,7 +154,7 @@ pub struct AcmeConfig {
     /// Assumed validity duration of an issued cert, used only to compute
     /// renewal-due (this module never parses the X.509 `notAfter` field —
     /// it uses the cert file's own mtime as "issued_at" instead, see
-    /// [`is_renewal_due`]). Default 90 days, the current LE/ZeroSSL
+    /// [`acme_engine::renewal_decision`]). Default 90 days, the current LE/ZeroSSL
     /// standard; override for a custom directory with a different
     /// lifetime.
     pub cert_lifetime: Duration,
@@ -268,12 +270,49 @@ fn parse_env_u64(get: &impl Fn(&str) -> Option<String>, key: &str, default: u64)
 // Renewal-due disk check (wraps the engine's pure decision)
 // ---------------------------------------------------------------------------
 
-/// IO wrapper around [`acme_engine::is_renewal_due`]: treats a missing cert (or a cert
+/// IO wrapper around [`acme_engine::renewal_decision`]: treats a missing cert (or a cert
 /// present without its key) as unconditionally due, and otherwise uses the
 /// cert file's own mtime as "issued_at" — this module always atomically
 /// (re)writes both files together at issuance time (see
-/// [`write_cert_atomic`]), so the mtime is exactly the issuance time; no
-/// X.509 parsing needed to answer this question.
+/// [`write_cert_atomic`]), so the mtime is exactly the issuance time.
+///
+/// Age is not the only reason to reissue. The cert on disk is also read for
+/// its SAN set ([`acme_engine::cert_dns_names`]) and handed to the engine as
+/// [`acme_engine::CertSans::Known`], which compares it against
+/// `config.domains`: a cert that does not cover every configured name is due
+/// NOW regardless of how fresh it is. Without that, widening `PASSWAY_ACME_DOMAIN` and
+/// restarting logs "fresh enough — skipping" and keeps serving the old,
+/// narrower cert for up to `cert_lifetime - renew_before` — silently, with
+/// the config file reading as though the fix landed (R853-B8, found while
+/// fixing the live incident in R853-B7).
+///
+/// Coverage is checked against what a TLS client would accept, so a
+/// `*.yah.dev` SAN satisfies a configured `www.yah.dev`; see
+/// [`acme_engine::domains_not_covered`] for the exact rule. An unparseable
+/// cert file is due — this process could not serve it either.
+///
+/// @yah:ticket(R853-B8, "passway decides renewal from cert file mtime alone, so widening PASSWAY_ACME_DOMAIN silently serves the old narrower cert until expiry")
+/// @yah:status(review)
+/// @yah:at(2026-09-05T08:51:55Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R853)
+/// @yah:severity(medium)
+/// @yah:next("Watch the interaction with the R779 issuance-failure backoff marker: a config whose SAN set can never be satisfied (e.g. a name redundant with a wildcard, which LE rejects outright) would otherwise turn 'needs renewal' into a re-order loop. The .acme-failed marker already bounds this, but add a test that a coverage-driven renewal respects it.")
+/// @yah:verify("Regression test: write a cert whose SAN is [yah.dev] with a fresh mtime, configure domains = [*.yah.dev, yah.dev], assert cert_needs_renewal() == true. Confirm it fails on today's code (it returns false).")
+/// @yah:gotcha("FOUND WHILE FIXING R853-B7, 2026-09-05. cert_needs_renewal() reads only fs::metadata(cert_path).modified() and feeds it to is_renewal_due(); it never parses the cert on disk and never compares its SAN set against config.domains. So an operator who widens PASSWAY_ACME_DOMAIN (here: apex-only -> wildcard, to fix www on half the round-robin) and restarts gets 'existing cert is fresh enough - skipping first-boot issuance' and the door keeps serving the OLD, NARROWER cert until the mtime-based renewal window opens - up to 60 days later. The failure is silent and the config file reads as if the fix landed. This is exactly why B7 was fixed by issuing out of band to a scratch path and installing the result, rather than by editing the env and restarting.")
+/// @yah:handoff("FIXED. cert_needs_renewal (oss/passway/crates/passway/src/acme.rs) now reads the cert FILE, not just its metadata, and reissues when the SAN set does not cover config.domains — regardless of age. An unparseable cert file is also due (this process could not serve it either). Age remains the second check, unchanged.")
+/// @yah:handoff("THE MATCHING LIVES IN THE ENGINE, as two pure public functions beside is_renewal_due (oss/passway/crates/acme-engine/src/lib.rs): cert_dns_names(pem) -> Option<Vec<String>> reads the LEAF's dNSName SANs, normalized (lowercase, trailing root dot trimmed); domains_not_covered(have, wanted) -> Vec<String> returns the uncovered names so the log can name them back to the operator exactly as they wrote them. Coverage follows RFC 6125 as a TLS client applies it: exact match, or a *.example.com SAN covering exactly ONE more label — not the apex, not a.b.example.com, and a wildcard in config needs a wildcard in the cert (a bag of specific SANs does not add up to one). Both sides are normalized inside domains_not_covered rather than trusted; comparing raw strings would re-order a good cert forever over a capital letter, which is how this fix could have become a slow rate-limit burn.")
+/// @yah:handoff("cert_dns_names returns None for anything that is not a readable certificate and Some(vec![]) for a cert with no SAN extension — the distinction is load-bearing, since callers treat None as 'reissue'. It deliberately does NOT fall back to the Subject CN: CN-as-hostname is ignored by every current TLS client, so honouring it would report coverage no browser agrees with.")
+/// @yah:handoff("DISCOVERED AND FIXED IN PASS, and it is the reason this fix was not safe on its own. The steady-state AcmeRenewalService loop (acme.rs:~737) called issue_and_write DIRECTLY: it never consulted the R779 issuance-backoff marker and never recorded a failure into it. issuance_backoff_remaining had exactly ONE production caller, ensure_cert_on_disk. That was survivable while renewal was driven by age alone (changes at most once per cert lifetime), but this ticket's own @yah:next flagged the consequence: once COVERAGE drives renewal, a config the CA will never satisfy re-orders every check_interval forever, straight into Let's Encrypt's 5-failed-validations/hour/identifier limit. Both paths now go through one new issue_respecting_backoff(config, tokens, now) so a third call site cannot reintroduce the gap, and the refusal message is shared via backoff_refusal() so the two checks cannot drift. A refusal deliberately does NOT record a failure — no order was attempted, and recording one would double the backoff on every tick off failures that never happened (there is a test for exactly that).")
+/// @yah:handoff("x509-parser 0.18 moved from dev-dependency to a real dependency of passway-acme. Not a new supply-chain surface: it arrived in this workspace as the R779-P8 Pebble test's dev-dep and was already in the graph. rcgen 0.14 added as an acme-engine dev-dep so the tests assert against a real DER encoding rather than a checked-in fixture that could rot into agreeing with a hand-written blob. cargo deny stays fully green.")
+/// @yah:handoff("FIXED THREE PRE-EXISTING TESTS THAT WERE PASSING FOR THE WRONG REASON: cert_needs_renewal_false_for_a_freshly_written_cert_and_key and cert_needs_renewal_true_once_lifetime_and_renew_before_are_both_zero wrote the literal string \"cert pem\" to the cert path. The check that made that acceptable IS the check this bug was. They now write a real self-signed cert covering the configured names, so the age test still tests age.")
+/// @yah:verify("MUTATION CONTROL, per this ticket's own verify line. With the coverage branch's `return Ok(true)` removed, exactly ONE test fails — cert_needs_renewal_true_when_the_cert_does_not_cover_a_widened_config (6 passed / 1 failed) — and it is the B8 regression test. Restored and re-run green. So the test has teeth and this is not a test that would pass either way.")
+/// @yah:verify("cargo test --manifest-path oss/passway/Cargo.toml --workspace --lib -> passway 130 / passway-acme 24 / passway-demux 19, 0 failed. Was 125 / 15 / 19 before this pass: +5 passway (3 coverage cases, 2 backoff-enforcement async tests) and +9 passway-acme (6 pure-matching, 3 cert_dns_names).")
+/// @yah:verify("passway integration, built then run DIRECTLY as oss/passway/target/debug/deps/main-7d74632cfa65bb79 (the camp daemon has no keychain — see R779's P2 gotcha) -> 28 passed / 0 failed.")
+/// @yah:verify("cargo clippy --manifest-path oss/passway/Cargo.toml --workspace --all-targets -> exit 0, exactly the 3 pre-existing warnings (auth.rs case-insensitive compare, path.rs Result<_,()>, proxy.rs manual Option::zip). Nothing added.")
+/// @yah:verify("cargo deny --manifest-path oss/passway/Cargo.toml check -> advisories ok, bans ok, licenses ok, sources ok, with x509-parser promoted to a real dep.")
+/// @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib -> 708 passed / 0 failed. yubaba consumes acme-engine, and the change is purely additive (two new pub fns), so this confirms no downstream break.")
+/// @yah:gotcha("SCOPE, STATED LOUDLY: this fixes passway only. The IDENTICAL defect is live in yubaba's fleet issuer — acme_issuer.rs:424-432 decides renewal from the record's updated_at alone, and its domain list is operator-widenable via YUBABA_ACME_EXTRA_DOMAINS. Filed as R853-B9 rather than folded in here, because passway reads its cert off disk while yubaba's is a SEALED SecretRecord, so coverage there costs a KEK unseal per tick — a genuine design fork (three options weighed on the ticket, with a recommendation), not a mechanical port of this change. The engine helpers this ticket added are exactly what B9 needs; it should not rewrite the matching.")
 fn cert_needs_renewal(config: &AcmeConfig, now: SystemTime) -> io::Result<bool> {
     let cert_meta = match std::fs::metadata(&config.cert_path) {
         Ok(m) => m,
@@ -283,8 +322,36 @@ fn cert_needs_renewal(config: &AcmeConfig, now: SystemTime) -> io::Result<bool> 
     if !Path::new(&config.key_path).is_file() {
         return Ok(true);
     }
-    let issued_at = cert_meta.modified()?;
-    Ok(is_renewal_due(issued_at, config.cert_lifetime, config.renew_before, now))
+
+    // Reading the file (rather than only its metadata) is the whole point —
+    // mtime cannot see a SAN set. The engine puts coverage ahead of age.
+    let san_names = cert_dns_names(&std::fs::read_to_string(&config.cert_path)?);
+    let decision = renewal_decision(
+        san_names.as_deref().map_or(CertSans::Unreadable, CertSans::Known),
+        &config.domains,
+        cert_meta.modified()?,
+        config.cert_lifetime,
+        config.renew_before,
+        now,
+    );
+
+    match &decision {
+        RenewalDecision::DueUnreadable => log::warn!(
+            "passway acme: cert at {} is not a readable certificate — treating it as due for reissue",
+            config.cert_path
+        ),
+        RenewalDecision::DueForCoverage(missing) => log::warn!(
+            "passway acme: cert at {} covers [{}] but the configured domains are [{}] — \
+             missing [{}], so it is due for reissue regardless of age",
+            config.cert_path,
+            san_names.unwrap_or_default().join(", "),
+            config.domains.join(", "),
+            missing.join(", ")
+        ),
+        RenewalDecision::DueForAge | RenewalDecision::Fresh => {}
+    }
+
+    Ok(decision.is_due())
 }
 
 // ---------------------------------------------------------------------------
@@ -457,15 +524,11 @@ pub async fn ensure_cert_on_disk(config: &AcmeConfig) -> Result<(), AcmeError> {
         );
         return Ok(());
     }
+    // Checked here as well as inside `issue_respecting_backoff` so a refusal
+    // does not first bind the HTTP-01 responder on :80 — that bind can fail
+    // for its own reasons and would mask the real, actionable answer.
     if let Some(remaining) = issuance_backoff_remaining(config, SystemTime::now()) {
-        return Err(AcmeError::Config(format!(
-            "passway acme: a previous issuance for [{}] failed and the backoff has {}s left \
-             (marker {}) — not ordering again yet, so a broken DNS record cannot burn the \
-             CA's failed-validation budget; delete the marker to force a retry",
-            config.domains.join(", "),
-            remaining.as_secs(),
-            failure_marker_path(config).display()
-        )));
+        return Err(backoff_refusal(config, remaining));
     }
 
     log::warn!(
@@ -489,15 +552,60 @@ pub async fn ensure_cert_on_disk(config: &AcmeConfig) -> Result<(), AcmeError> {
         }
         AcmeChallengeKind::Dns01Cloudflare { .. } => None,
     };
-    let result = issue_and_write(config, &tokens).await;
+    let result = issue_respecting_backoff(config, &tokens, SystemTime::now()).await;
     if let Some(task) = accept_task {
         task.abort();
     }
+    result
+}
+
+/// The one place an ACME order is allowed to start: refuse while the failure
+/// backoff is unexpired, otherwise issue and record the outcome into the
+/// marker.
+///
+/// Both issuance paths go through here — first-boot ([`ensure_cert_on_disk`])
+/// and the steady-state [`AcmeRenewalService`] loop. Until R853-B8 only the
+/// first-boot path consulted the marker, so a renewal that could never
+/// succeed re-ordered every `check_interval` forever and neither wrote nor
+/// respected a backoff. That was survivable only because renewal was driven
+/// by age alone, which changes at most once per cert lifetime; making
+/// coverage drive it (a config asking for a name the CA will not issue — a
+/// name redundant with a wildcard, say) turns the same loop into a steady
+/// burn of the CA's 5-failed-validations/hour/identifier budget. The gate and
+/// the thing it gates belong in one function so a third call site cannot
+/// reintroduce the gap.
+///
+/// A refusal deliberately does NOT call [`record_issuance_failure`]: no order
+/// was attempted, and recording one would double the backoff on every tick,
+/// growing it without bound from failures that never happened.
+async fn issue_respecting_backoff(
+    config: &AcmeConfig,
+    tokens: &ChallengeTokens,
+    now: SystemTime,
+) -> Result<(), AcmeError> {
+    if let Some(remaining) = issuance_backoff_remaining(config, now) {
+        return Err(backoff_refusal(config, remaining));
+    }
+    let result = issue_and_write(config, tokens).await;
     match &result {
         Ok(()) => clear_issuance_failure(config),
-        Err(_) => record_issuance_failure(config, SystemTime::now()),
+        Err(_) => record_issuance_failure(config, now),
     }
     result
+}
+
+/// The operator-facing refusal message, shared by the pre-flight check in
+/// [`ensure_cert_on_disk`] and the enforcing one in
+/// [`issue_respecting_backoff`] so the two can never drift apart.
+fn backoff_refusal(config: &AcmeConfig, remaining: Duration) -> AcmeError {
+    AcmeError::Config(format!(
+        "passway acme: a previous issuance for [{}] failed and the backoff has {}s left \
+         (marker {}) — not ordering again yet, so a broken DNS record cannot burn the \
+         CA's failed-validation budget; delete the marker to force a retry",
+        config.domains.join(", "),
+        remaining.as_secs(),
+        failure_marker_path(config).display()
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -646,7 +754,7 @@ impl BackgroundService for AcmeRenewalService {
                                 "passway acme: cert for [{}] is due for renewal",
                                 self.config.domains.join(", ")
                             );
-                            match issue_and_write(&self.config, &tokens).await {
+                            match issue_respecting_backoff(&self.config, &tokens, SystemTime::now()).await {
                                 Ok(()) => log::info!(
                                     "passway acme: renewed cert written to {} — this process keeps serving \
                                      the OLD cert until a graceful-upgrade restart picks up the new files \
@@ -731,12 +839,66 @@ mod tests {
         assert!(cert_needs_renewal(&config, SystemTime::now()).unwrap());
     }
 
+    /// A self-signed cert carrying exactly `names`, so the coverage half of
+    /// `cert_needs_renewal` sees a real SAN set instead of a placeholder
+    /// string. Before R853-B8 these tests wrote the literal `"cert pem"`,
+    /// which is not a certificate at all — the check that made that fine is
+    /// the check the bug was.
+    fn self_signed_pem(names: &[&str]) -> String {
+        let rcgen::CertifiedKey { cert, .. } =
+            rcgen::generate_simple_self_signed(names.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .expect("self-signed leaf");
+        cert.pem()
+    }
+
+    /// Write a cert covering `names` plus a key, both fresh.
+    fn write_cert_for(config: &AcmeConfig, names: &[&str]) {
+        write_cert_atomic(&config.cert_path, &config.key_path, &self_signed_pem(names), "key pem").unwrap();
+    }
+
     #[test]
     fn cert_needs_renewal_false_for_a_freshly_written_cert_and_key() {
         let dir = tempfile_dir();
         let config = test_config(&dir);
-        write_cert_atomic(&config.cert_path, &config.key_path, "cert pem", "key pem").unwrap();
+        write_cert_for(&config, &["example.com"]);
         assert!(!cert_needs_renewal(&config, SystemTime::now()).unwrap());
+    }
+
+    /// R853-B8, the regression this ticket exists for. An operator widens
+    /// `PASSWAY_ACME_DOMAIN` from the apex to apex+wildcard and restarts; the
+    /// cert on disk has a brand-new mtime, so the age check says "fine".
+    /// Before the fix this returned `false` and the door kept serving the
+    /// narrow cert for up to 60 days.
+    #[test]
+    fn cert_needs_renewal_true_when_the_cert_does_not_cover_a_widened_config() {
+        let dir = tempfile_dir();
+        let mut config = test_config(&dir);
+        config.domains = vec!["*.yah.dev".to_string(), "yah.dev".to_string()];
+        write_cert_for(&config, &["yah.dev"]);
+        assert!(cert_needs_renewal(&config, SystemTime::now()).unwrap());
+    }
+
+    /// The other direction, and the one that would cost real money to get
+    /// wrong: a wildcard cert DOES cover a configured subdomain, so a
+    /// perfectly good cert must not be re-ordered on every check.
+    #[test]
+    fn cert_needs_renewal_false_when_a_wildcard_cert_covers_the_configured_names() {
+        let dir = tempfile_dir();
+        let mut config = test_config(&dir);
+        config.domains = vec!["www.yah.dev".to_string(), "yah.dev".to_string()];
+        write_cert_for(&config, &["yah.dev", "*.yah.dev"]);
+        assert!(!cert_needs_renewal(&config, SystemTime::now()).unwrap());
+    }
+
+    /// A cert path holding something that is not a certificate (a truncated
+    /// write, a key written to the wrong path) is due — this process could
+    /// not serve it either, so "reissue" is the only useful answer.
+    #[test]
+    fn cert_needs_renewal_true_when_the_cert_file_is_not_a_certificate() {
+        let dir = tempfile_dir();
+        let config = test_config(&dir);
+        write_cert_atomic(&config.cert_path, &config.key_path, "cert pem", "key pem").unwrap();
+        assert!(cert_needs_renewal(&config, SystemTime::now()).unwrap());
     }
 
     #[test]
@@ -754,8 +916,62 @@ mod tests {
         let mut config = test_config(&dir);
         config.cert_lifetime = Duration::ZERO;
         config.renew_before = Duration::ZERO;
-        write_cert_atomic(&config.cert_path, &config.key_path, "cert pem", "key pem").unwrap();
+        // A cert that DOES cover the config, so the coverage check passes and
+        // this still tests the age path it names.
+        write_cert_for(&config, &["example.com"]);
         assert!(cert_needs_renewal(&config, SystemTime::now()).unwrap());
+    }
+
+    // -- backoff enforcement shared by both issuance paths (R853-B8) ------
+
+    /// The `@yah:next` this ticket carried: once COVERAGE can drive renewal,
+    /// a config the CA will never satisfy would re-order every
+    /// `check_interval`. Both issuance paths now go through
+    /// `issue_respecting_backoff`, so an unexpired marker refuses before any
+    /// order — this is the assertion that the renewal loop, which never
+    /// consulted the marker at all before R853-B8, now does.
+    #[tokio::test]
+    async fn a_coverage_driven_renewal_still_respects_the_failure_backoff() {
+        let dir = tempfile_dir();
+        let mut config = test_config(&dir);
+        config.domains = vec!["*.yah.dev".to_string(), "yah.dev".to_string()];
+        write_cert_for(&config, &["yah.dev"]);
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+        // Due for coverage reasons, not age.
+        assert!(cert_needs_renewal(&config, t0).unwrap());
+
+        record_issuance_failure(&config, t0);
+        let tokens: ChallengeTokens = Arc::new(RwLock::new(HashMap::new()));
+        let err = issue_respecting_backoff(&config, &tokens, t0)
+            .await
+            .expect_err("an unexpired marker must refuse to order");
+        assert!(
+            matches!(&err, AcmeError::Config(msg) if msg.contains("backoff has")),
+            "expected the backoff refusal, got: {err}"
+        );
+    }
+
+    /// A refusal is not a failure: it must not escalate the backoff, or a
+    /// loop that ticks faster than `FAILURE_BACKOFF_INITIAL` would double the
+    /// wait forever off orders that were never placed.
+    #[tokio::test]
+    async fn refusing_under_backoff_does_not_escalate_it() {
+        let dir = tempfile_dir();
+        let config = test_config(&dir);
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        record_issuance_failure(&config, t0);
+        assert_eq!(issuance_backoff_remaining(&config, t0), Some(FAILURE_BACKOFF_INITIAL));
+
+        let tokens: ChallengeTokens = Arc::new(RwLock::new(HashMap::new()));
+        for _ in 0..5 {
+            assert!(issue_respecting_backoff(&config, &tokens, t0).await.is_err());
+        }
+        assert_eq!(
+            issuance_backoff_remaining(&config, t0),
+            Some(FAILURE_BACKOFF_INITIAL),
+            "a refusal recorded a failure it never attempted"
+        );
     }
 
     // -- write_cert_atomic round trip ------------------------------------

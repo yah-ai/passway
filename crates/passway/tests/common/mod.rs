@@ -26,7 +26,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use passway::auth::{CheersAuth, RouteAuthPolicy};
 use passway::proxy::PassProxy;
-use passway::routing::{build_host_router, HostKey};
+use passway::routing::{build_host_router, HostKey, UpstreamSet};
 use passway::upstream::{build_load_balancer, StaticUpstreams, UpstreamSource};
 
 /// Reserve an ephemeral local port and immediately release it. Small
@@ -177,10 +177,10 @@ pub fn build_host_routed_proxy(
         >,
     >,
 ) {
-    let sources: Vec<(HostKey, Arc<dyn UpstreamSource>)> = sets
+    let sources: Vec<UpstreamSet> = sets
         .into_iter()
         .map(|(key, addrs)| {
-            (
+            UpstreamSet::new(
                 key,
                 Arc::new(StaticUpstreams::new(addrs)) as Arc<dyn UpstreamSource>,
             )
