@@ -46,6 +46,10 @@
 //!   the same form the upstream resolves.
 //! - [`health`] — the `/health` readiness computation, independent of any
 //!   pingora type.
+//! - [`sd_notify`] — R870-T3: the `MAINPID=`/`READY=1` datagram that lets a
+//!   `Type=notify` systemd unit follow pingora's graceful upgrade to the
+//!   replacement process, so a cert rotation on a systemd door swaps the
+//!   process without dropping a connection.
 //! - [`tls`] — TLS listener configuration: v0's bring-your-own-cert path,
 //!   plus the documented ACME hook for a follow-up ticket.
 //!
@@ -93,6 +97,7 @@ pub mod path;
 pub mod proxy;
 pub mod redirect;
 pub mod routing;
+pub mod sd_notify;
 pub mod socket_activation;
 pub mod tls;
 pub mod upstream;

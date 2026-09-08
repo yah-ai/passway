@@ -5,7 +5,7 @@
 
 [package]
 name = "fdspike"
-version = "0.8.33"
+version = "0.8.34"
 edition = "2021"
 publish = false
 

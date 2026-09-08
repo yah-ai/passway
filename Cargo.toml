@@ -10,7 +10,7 @@
 # reserve-crate-names.sh or `cargo publish` here; that is the operator's
 # move, not this ticket's.
 [workspace]
-members = ["crates/passway", "crates/acme-engine", "crates/sni-demux"]
+members = ["crates/passway", "crates/acme-engine", "crates/sni-demux", "crates/http-router"]
 resolver = "2"
 
 # R853-F6 (2026-09-04): the carried pingora fork is GONE. passway used to pin
@@ -37,7 +37,7 @@ resolver = "2"
 # for everyone on crates.io while working fine in this monorepo.
 
 [workspace.package]
-version = "0.8.33"
+version = "0.8.34"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"

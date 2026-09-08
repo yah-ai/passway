@@ -1,0 +1,37 @@
+[package]
+# R870-F1: the `:80` tier. One hot process on port 80 that reads each
+# request's `Host` header and either answers `308 https://<host><target>`
+# itself or splices the connection to that tenant's own plaintext backend.
+# The `:443` fan-in is `passway-demux`; this is its plaintext twin, and it is
+# a SEPARATE BINARY on purpose — see the crate doc in src/lib.rs.
+name = "passway-http-router"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Multi-tenant HTTP Host router for passway (W267 / R870): reads the Host header on :80 and either answers a host-preserving 308 to https or splices the connection to that tenant's plaintext backend."
+keywords = ["http", "host", "proxy", "ingress", "redirect"]
+categories = ["network-programming"]
+
+[lib]
+name = "http_router"
+
+[[bin]]
+name = "passway-http-router"
+path = "src/main.rs"
+
+# TRUST-BOUNDARY crate (same posture as passway and passway-demux): a public
+# listener parsing untrusted bytes. Deliberately dependency-light — the
+# request-head reader is hand-written over `&[u8]` and the proxy leg is
+# `tokio::io::copy_bidirectional`. No TLS library, no HTTP library, no
+# credential: the only secret-shaped thing this process could leak is the
+# route table it already publishes to disk.
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync"] }
+log = "0.4"
+env_logger = "0.11"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"

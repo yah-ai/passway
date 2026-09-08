@@ -65,16 +65,42 @@
 //! 2. The supervisor starts a **new** passway process: same env, plus
 //!    `PASSWAY_UPGRADE=true`, and the *same* `PASSWAY_PID_FILE` /
 //!    `PASSWAY_UPGRADE_SOCK` as the process it's replacing.
-//! 3. Once the new process is up, the supervisor sends `SIGQUIT` to the
-//!    *old* process's pid (read from `PASSWAY_PID_FILE`).
+//! 3. As soon as the new process has **bound `PASSWAY_UPGRADE_SOCK`**, the
+//!    supervisor sends `SIGQUIT` to the *old* process's pid (read from
+//!    `PASSWAY_PID_FILE`).
 //! 4. The old process hands its listening fds to the new one over
 //!    `PASSWAY_UPGRADE_SOCK` and drains in-flight connections; the new
 //!    process — already running with the fresh cert files — takes over.
+//!
+//! **Step 3's trigger is the socket, not "the new process is up", and this
+//! doc said the wrong thing until R870-T3 built a supervisor against it.**
+//! The two are not the same moment and cannot be: the new process *blocks
+//! inside* `Server::bootstrap()` waiting to receive, so it is never "up"
+//! before the `SIGQUIT`. Nor is the window generous. pingora's receiving
+//! half gives up after `MAX_RETRY`(5) × `RETRY_INTERVAL`(1s) and then
+//! `Bootstrap` calls `std::process::exit(1)`
+//! (`pingora-core-0.8.1/src/server/{transfer_fd/mod.rs,bootstrap_services.rs}`),
+//! so a `SIGQUIT` more than ~5s late kills the replacement outright while
+//! one sent early burns the sender's own retry budget instead. The socket
+//! path is an exact signal for that window because pingora's receiver
+//! creates it on entry and unlinks it on both exits — which is what
+//! `app/yah/cli/resources/passway-graceful-upgrade` waits on.
 //!
 //! This process never sends itself `SIGQUIT` or execs a replacement: step
 //! 2 (spawning a live sibling before the handoff) is an orchestration
 //! action only the supervisor can safely sequence — see `tls.rs`'s module
 //! doc for exactly why a self-triggered upgrade would be actively unsafe.
+//!
+//! **On a systemd door the supervisor is systemd, and it needs one more
+//! piece** (R870-T3): `Type=simple` equates the unit with the pid it
+//! exec'd, so the old process's exit at the end of step 4 would deactivate
+//! the unit and kill the replacement with it. The drop-in
+//! `app/yah/cli/resources/passway-graceful-upgrade.conf` makes the unit
+//! `Type=notify` + `NotifyAccess=all` and points `ExecReload=` at the
+//! helper above; `passway::sd_notify` sends the `MAINPID=`/`READY=1`
+//! datagram that moves systemd's idea of the main process onto the
+//! replacement. `systemctl reload <unit>` is then the whole rotation, and
+//! is what `YUBABA_CERT_FILES_RELOAD_CMD` should be set to.
 //!
 //! ## Choosing an upstream source (R594-F8)
 //!
@@ -1231,6 +1257,18 @@ fn main() {
     }
 
     log::info!("passway listening on {listen}");
+
+    // R870-T3: claim the unit's main-pid slot before serving. Inert unless
+    // systemd started us (`$NOTIFY_SOCKET` unset everywhere else), and the
+    // whole point on a graceful upgrade: this process already holds the
+    // inherited listening fds — `server.bootstrap()` above is where it took
+    // them — and the predecessor is draining out, so systemd has to be told
+    // that the pid it exec'd is no longer the door. See `sd_notify`'s module
+    // doc for why `Type=simple` cannot express that, and for the two caveats
+    // (READY lands microseconds before the bind; `Type=notify` makes a slow
+    // first ACME issuance fatal without a raised `TimeoutStartSec`).
+    passway::sd_notify::notify_ready(|k| std::env::var(k).ok());
+
     server.run_forever();
 }
 

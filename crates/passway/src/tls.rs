@@ -109,12 +109,37 @@
 //! 2. The supervisor starts a **new** passway process, same env plus
 //!    `PASSWAY_UPGRADE=true` (and the same `PASSWAY_PID_FILE`/
 //!    `PASSWAY_UPGRADE_SOCK` as the process it's replacing).
-//! 3. Once the new process logs that it's up (past `server.bootstrap()`),
-//!    the supervisor sends `SIGQUIT` to the *old* process's pid (read from
+//! 3. As soon as the new process has **bound `upgrade_sock`**, the
+//!    supervisor sends `SIGQUIT` to the *old* process's pid (read from
 //!    `PASSWAY_PID_FILE`).
 //! 4. The old process hands its listening fds to the new one over
 //!    `upgrade_sock` and drains in-flight connections; the new process —
 //!    already running with the fresh cert files ACME wrote — takes over.
+//!
+//! Step 3 used to read "once the new process logs that it's up (past
+//! `server.bootstrap()`)", which is **impossible** — `bootstrap()` is
+//! precisely where the replacement blocks waiting to receive, so it is never
+//! "up" beforehand. Corrected on R870-T3, which built the supervisor and
+//! found out. The window is also small: the receive gives up after
+//! `MAX_RETRY`(5) × `RETRY_INTERVAL`(1s) and `Bootstrap` then
+//! `std::process::exit(1)`s, so a late `SIGQUIT` kills the replacement.
+//! Waiting on the socket path is exact — pingora's receiver creates it on
+//! entry and unlinks it on both exits.
+//!
+//! ## On a systemd door, systemd is that supervisor (R870-T3)
+//!
+//! And it needs one thing pingora cannot give it: `Type=simple` equates the
+//! unit with the pid it exec'd, so the old process's exit at the end of step
+//! 4 deactivates the unit and — under the default `KillMode=control-group` —
+//! kills the replacement. The drop-in
+//! `app/yah/cli/resources/passway-graceful-upgrade.conf` makes the unit
+//! `Type=notify` + `NotifyAccess=all` with an `ExecReload=` pointing at
+//! `passway-graceful-upgrade`, and [`crate::sd_notify`] sends the
+//! `MAINPID=`/`READY=1` datagram that moves systemd's main pid onto the
+//! replacement. `systemctl reload <unit>` is then the entire rotation —
+//! including the one yubaba's `cert_materialize` runs as
+//! `YUBABA_CERT_FILES_RELOAD_CMD`, where the value used to be
+//! `systemctl restart` and dropped every connection on :443.
 //!
 //! ## First-boot bootstrapping
 //!
@@ -161,15 +186,20 @@
 //! @yah:handoff("FOLLOW-UP FILED: R779 (spike) - 'Free-tier ingress at 10k domains: SNI demux + cold per-domain passway, on-demand TLS, cert store off raft'. Operator corrected this ticket's framing on 2026-08-15: the three items R777 recorded as 'walls' are SOLVED PROBLEMS that hosting companies far below Amazon/Google funding have shipped for years, and calling them walls set the wrong weight. W267's section was rewritten to match - they are three SELECTION decisions, with Caddy/certmagic named as the closest open-source prior art (N unknown domains, cert each, issued on first handshake behind an allowlist gate, pluggable cert storage) which answers two of the three outright. R777's own verdict is unaffected.")
 //!
 //! @yah:ticket(R870-T3, "Zero-downtime cert install on a systemd door: wire the PASSWAY_UPGRADE handoff so a rotation does not drop connections")
-//! @yah:at(2026-09-05T20:31:55Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-09-06T07:55:53Z)
 //! @yah:phase(P2)
 //! @yah:parent(R870)
-//! @yah:next("R600-F10 names this as its own follow-on and does not build it. Its cert_materialize module runs an operator-written reload command, and for the two live doors the honest value is `systemctl restart passway`, which drops in-flight connections on that origin. passway cannot hot-swap a cert — tls.rs \"The reload gap\" records that TlsSettings is static — so the zero-downtime path is a REPLACEMENT process started with PASSWAY_UPGRADE=true before the old one takes SIGQUIT. No systemd unit on either node has that wired.")
-//! @yah:next("THE MACHINERY NOW EXISTS AND IS THE REASON TO DO THIS HERE RATHER THAN INVENTING ONE. R853-F6 replaced the carried pingora fork with pingora OWN SCM_RIGHTS upgrade socket (oss/passway/crates/passway/src/socket_activation.rs) — the same protocol pingora uses to inherit listeners from a previous pingora. That is the seam a graceful systemd restart needs. Reuse it; do not add a second handoff path. Linux-only after F6, so it cannot be exercised on the darwin camp machines.")
-//! @yah:next("SCALES WITH TENANTS, which is why it belongs to this relay. One origin blipping under R600-F10 rolling_stagger is survivable at two doors. At N per-tenant passways behind the demux each holding its own cert, a fleet rotation is N connection-dropping restarts, and the cold JIT tier makes it worse: kamaji holds the listener, so a restarted cold passway is a fork, not a bound socket. Check whether the cold path needs this at all before building it for both.")
 //! @arch:see(.yah/docs/working/W267-sovereign-public-ingress.md)
 //! @yah:depends_on(R600-F10)
+//! @yah:handoff("SHIPPED. `systemctl reload <unit>` is now a zero-downtime process swap on a systemd passway door. Three pieces: (1) NEW oss/passway/crates/passway/src/sd_notify.rs — the MAINPID=/READY=1 datagram, ~60 lines, no new dependency, inert unless $NOTIFY_SOCKET is set; main.rs sends it just before run_forever(). (2) NEW app/yah/cli/resources/passway-graceful-upgrade — the ExecReload= helper: spawn a replacement with PASSWAY_UPGRADE=true, wait for it to BIND PASSWAY_UPGRADE_SOCK, SIGQUIT the old pid, then block until systemd's MainPID is the replacement. (3) NEW app/yah/cli/resources/passway-graceful-upgrade.conf — the drop-in carrying Type=notify + NotifyAccess=all + ExecReload= + TimeoutStartSec=300 + Restart=always.")
+//! @yah:verify("cargo test --manifest-path oss/passway/Cargo.toml -p passway --lib = 138 passed / 0 failed (8 new, sd_notify, incl. a real datagram round-trip through a bound UnixDatagram). --test main = 28 passed. cargo build -p passway --bins clean. cargo clippy -p passway --all-targets = 3 warnings, ALL pre-existing and in files this pass never touched (auth.rs result_unit_err, path.rs case-insensitive compare, proxy.rs manual_option_zip).")
+//! @yah:gotcha("THE ONE UNVERIFIED LINK, stated plainly: nothing here has been run against systemd or against Linux. The camp is darwin; pingora's fd transfer is cfg(target_os = \"linux\") and the MAINPID handover needs a real service manager. What IS exercised on darwin: the notify datagram end-to-end against a bound socket, and the helper's four refusal paths run as a real `sh` process (they all exit before anything is spawned). The specific claim I could not test is that systemd accepts a MAINPID= datagram from a process that is not yet the main one, during SERVICE_RELOAD, under NotifyAccess=all. If it does not, the helper times out and says exactly that, and Restart=always turns the torn handoff into a RestartSec blip rather than a dark :443.")
+//! @yah:next("ALL THREE FILING BULLETS ARE ANSWERED; they are replaced rather than kept because the first now states the opposite of what shipped. (1) The reload command is `systemctl reload <unit>`, not `systemctl restart` — R600-F10's own next list has been corrected to match. (2) No second handoff path was added: the helper drives pingora's existing upgrade socket, exactly as socket_activation.rs does for LISTEN_FDS, and refuses outright when both are in play. (3) THE COLD PATH NEEDS NONE OF THIS, checked rather than assumed: kamaji's SocketCustodian never releases the listener across a fork (oss/kamaji/crates/kamaji/src/jit.rs module doc — 'does **not** release the socket; it loops back to (1) and re-arms', 'zero dropped connections'), so a cold passway's replacement is a fork against a socket the supervisor still holds. The helper refuses a LISTEN_FDS door and says so in the refusal message; there is one mechanism per tier, not one mechanism built twice.")
+//! @yah:handoff("WIDER THAN THE TITLE — four discovered fixes, all in this pass. (a) THE SIGNAL CONTRACT WAS WRONG and had been since R594-F7: both tls.rs and main.rs said the supervisor SIGQUITs 'once the new process is up (past server.bootstrap())', which is impossible — bootstrap() is where the replacement blocks waiting to receive. The real trigger is 'has bound upgrade_sock', and the window is ~5s (MAX_RETRY 5 x RETRY_INTERVAL 1s, then Bootstrap exit(1)s). Corrected at both sites; the helper waits on the socket path, which pingora creates on entry and unlinks on both exits. (b) yubaba cert_materialize.rs: RELOAD_CMD_ENV's doc said 'e.g. systemctl restart passway' — now says reload, and why. (c) THE RELEASE RAIL carries the helper: publish-yubaba-release.sh stages it (the one non-ELF member, outside the ELF assertion loop) + layout assertion; control_plane_install.{sh,rs} install it on its own conditional with a rollback anchor and a content assertion; roll-node.sh keys and asserts its hash like every other member. The DROP-IN deliberately does not ride the roll — it lands in /etc/systemd/system/&lt;unit&gt;.service.d/, the unit name differs per door, and a roll must never rewrite a door's unit configuration; two tests hold that split. (d) roll-node.sh's and control_plane_install.sh's operator-facing text said a restart is the only activation verb; both now name the reload.")
+//! @yah:verify("cargo test -p yah --test main camp_systemd_unit_emit = 13 passed (4 new: the drop-in's four directives; the helper's step ORDER — spawn &lt; wait-for-socket &lt; SIGQUIT &lt; wait-for-MainPID; the ships-in-tarball/drop-in-is-node-state split; and the four refusal paths run as a real `sh` process). cargo test --manifest-path oss/yah-base/Cargo.toml -p yah-workload-spec --lib control_plane_install = 12 passed (1 new). cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib cert_materialize = 8 passed. `sh -n` + shellcheck -s sh on the helper: clean. `bash -n` on roll-node.sh and publish-yubaba-release.sh: clean; shellcheck on both reports only pre-existing SC2012/SC2029/SC3040/SC3043 in hunks this pass never touched.")
+//! @yah:verify("THE LIVE REHEARSAL, not run, so whoever holds the authorization does not re-derive it. On ONE door, in a window where a blip is acceptable: (1) roll the node so /usr/local/bin/passway-graceful-upgrade and the new passway are present; (2) confirm the door's env pins PASSWAY_UPGRADE_SOCK to a per-instance path — unset it is pingora's shared /tmp/pingora_upgrade.sock and every door runs two passways; (3) install app/yah/cli/resources/passway-graceful-upgrade.conf as /etc/systemd/system/&lt;unit&gt;.service.d/, `systemctl daemon-reload`, then ONE `systemctl restart &lt;unit&gt;` and watch `journalctl -u &lt;unit&gt; -f` for 'passway: notified systemd READY with MAINPID=&lt;pid&gt;' within a second of the listener line — if it is absent, remove the drop-in and daemon-reload before debugging rather than leaving a front door restart-looping; (4) THE ACTUAL TEST: start a slow request against the door (`curl --limit-rate` or a long download), run `systemctl reload &lt;unit&gt;`, and assert three things — the in-flight request completes, no connection is refused during the swap, and `systemctl show -p MainPID` names a NEW pid while `systemctl is-active` stayed active throughout. (5) Only then set YUBABA_CERT_FILES_RELOAD_CMD=`systemctl reload &lt;unit&gt;` in that node's yubaba drop-in.")
 
 use pingora::listeners::tls::TlsSettings;
 
