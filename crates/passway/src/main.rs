@@ -12,6 +12,7 @@
 //! | `PASSWAY_TLS_CERT` | PEM cert chain path | required |
 //! | `PASSWAY_TLS_KEY` | PEM private key path | required |
 //! | `PASSWAY_TLS_MODE` | `manual` (bring-your-own-cert) or `acme` (R594-F7) | `manual` |
+//! | `PASSWAY_ALPN` | R870-T21: which application protocols the TLS listener offers. `h2,http/1.1` or `http/1.1`. Set it to `http/1.1` on a door fronting a protocol negotiated by an HTTP/1.1 `Upgrade:` handshake (TS2021, RFC-6455 WebSocket) — RFC 9113 §8.2.2 forbids `Upgrade` over h2, so such a request cannot survive an h2 connection at all. An unrecognized value is a boot failure, not the default | `h2,http/1.1` |
 //! | `PASSWAY_ACME_DOMAIN` | comma-separated SAN list to issue for (wildcards need `dns-01`) | required if `PASSWAY_TLS_MODE=acme` |
 //! | `PASSWAY_ACME_CONTACT_EMAIL` | ACME account contact | required if `PASSWAY_TLS_MODE=acme` |
 //! | `PASSWAY_ACME_DIRECTORY` | `production`, `staging`, or a custom ACME directory URL (Pebble/step-ca) | `staging` |
@@ -30,13 +31,18 @@
 //! | `PASSWAY_ACME_BOOTSTRAP_TIMEOUT_SECS` | R779: cap on the first-boot issuance (certmagic's handshake budget); a timeout is recorded in the `<cert>.acme-failed` backoff marker | `180` |
 //! | `LISTEN_FDS` / `LISTEN_PID` | R779: systemd socket-activation convention — with `LISTEN_FDS=1` (and `LISTEN_PID` unset or equal to this pid) fd 3 is adopted as the `PASSWAY_LISTEN` socket instead of binding fresh; this is how the process sits behind kamaji's on-demand JIT tier | unset |
 //! | `PASSWAY_IDLE_TTL_SECS` | R779: exit once no request has been in flight for this long — for kamaji's on-demand JIT tier, which re-forks on the next connection. Unset = never | unset |
+//! | `PASSWAY_PATH_ROUTES_FILE` | R870-T18: path to this door's mount table (JSON, see [`passway::path_routes_file`]). Set = this process is a service's own **inner door**, routing by PATH between that service's components; the host-routed variables below are then rejected rather than merged, since one proxy is one strategy | unset (host-routed, as before) |
 //! | `PASSWAY_UPSTREAM_SOURCE` | `static` (from `PASSWAY_UPSTREAMS`) or `yubaba` (R594-F8 discovery) | `static` |
 //! | `PASSWAY_UPSTREAMS` | comma-separated backend list, optionally `<hostname>=` prefixed to give each fronted service its own set. R858-T1: honoured under `PASSWAY_UPSTREAM_SOURCE=yubaba` too, as a static pin that beats discovery for the hostnames it names | empty (fail-ready 503) |
 //! | `PASSWAY_YUBABA_URL` | base URL of the yubaba to discover upstreams from, e.g. `http://100.64.0.2:7443`. R844-F23: optionally `<hostname>=` prefixed, and repeating a hostname ADDS a yubaba — one per node the workload is placed on | required if `PASSWAY_UPSTREAM_SOURCE=yubaba` |
 //! | `PASSWAY_YUBABA_IDENT` | R844-B6: workload ident whose service records become this proxy's backends. A node hosts several workloads and the endpoint answers for all of them, so without this passway would adopt every Ready record on the node. R844-F20: optionally `<hostname>=` prefixed, exactly like `PASSWAY_UPSTREAMS`, to give each fronted hostname its own discovered set | required if `PASSWAY_UPSTREAM_SOURCE=yubaba` |
 //! | `PASSWAY_YUBABA_TIMEOUT_SECS` | per-request timeout for a discovery poll | `5` |
+//! | `PASSWAY_DISCOVERY_CACHE` | R870-F4: DIRECTORY in which each fronted hostname's last-known-good upstream set is persisted, so a restart holds the previous process's answer instead of fail-ready 503ing for a whole `PASSWAY_UPDATE_INTERVAL_SECS`. Point it at the door's own state dir (`/var/lib/passway-<name>`). A directory, not a file, because one process fronts several hostnames | unset (no persistence; a restart starts cold) |
+//! | `PASSWAY_DISCOVERY_CACHE_MAX_AGE_SECS` | how old a persisted set may be and still be seeded on start. Bounded because backend ports are kamaji-allocated, so a long-stale address may since belong to a different workload — past this, starting cold and 503ing is the correct answer | `300` |
 //! | `PASSWAY_UPSTREAM_TLS` | speak TLS to upstreams. Bare `true`/`false` is the process-wide default; R858-T1 also accepts the `<hostname>=` fan-in form (`cloud.mesh.yah.dev=true,*=false`) to give one fronted service its own scheme. An unrecognized value is a boot failure, not `false` | `false` (mesh is already encrypted) |
 //! | `PASSWAY_UPSTREAM_SNI` | SNI to present when upstream TLS is on. Bare string (process-wide) or the same `<hostname>=` fan-in form | empty |
+//! | `PASSWAY_HOLDING_DIR` | R870-F8: DIRECTORY holding this door's per-domain holding-page overrides — a `hosts` map plus `pages/<name>.html` bodies, written by `yubaba::demux_routes` from the enrollment set. An authority with no entry (and any door with this unset) gets passway's own [`passway::holding::HOLDING_PAGE`] | unset (no overrides) |
+//! | `PASSWAY_HOLDING_RELOAD_SECS` | how often that directory is re-read, so a page can change under a running door | `30` |
 //! | `PASSWAY_HEALTH_PATH` | `/health`-equivalent path | `/health` |
 //! | `PASSWAY_HEALTH_CHECK_INTERVAL_SECS` | TCP health-check cadence | `5` |
 //! | `PASSWAY_UPDATE_INTERVAL_SECS` | upstream-source re-poll cadence | `30` |
@@ -238,6 +244,48 @@
 //! `PASSWAY_UPSTREAM_SOURCE=static` ignores the discovery variables exactly as
 //! before.
 //!
+//! ## The inner door: routing by PATH instead of by host (R870-T18)
+//!
+//! Everything above answers "which upstream set serves this HOST". A passway
+//! deployed as one *service's own* inner door answers the other question —
+//! which set serves this PATH — dispatching between that service's mounted
+//! components (`/` → the site bundle, `/app` → the app bundle). The mechanism
+//! is [`passway::path_route`] (R870-F15); this binary's only job is to learn
+//! the table, and it learns it from a file:
+//!
+//! ```text
+//! PASSWAY_PATH_ROUTES_FILE=/etc/passway-<service>-path.routes.json
+//! ```
+//!
+//! ```json
+//! { "schema_version": 1,
+//!   "routes": [ { "mount": "", "upstreams": ["127.0.0.1:8081"] },
+//!               { "mount": "/app", "upstreams": ["127.0.0.1:8082"],
+//!                 "headers": {"cross-origin-opener-policy": "same-origin"} } ] }
+//! ```
+//!
+//! A file rather than another comma-separated variable because a mount carries
+//! an upstream *set* AND a header map — two nesting levels, which is what the
+//! demux/http-router route *files* already exist for. Why JSON rather than the
+//! TOML this repo's hand-written configs use is argued in full in
+//! [`passway::path_routes_file`]; the short version is that this table is
+//! generated by yah's `service.toml` + domain-manifest join rather than hand
+//! written, and `toml` is not otherwise in this trust-boundary crate's
+//! dependency graph while `serde_json` already is.
+//!
+//! **One proxy is one strategy.** Setting this variable alongside
+//! `PASSWAY_UPSTREAMS` / `PASSWAY_YUBABA_IDENT` / `PASSWAY_YUBABA_URL` is a
+//! boot failure, not a merge: [`passway::proxy::RoutingStrategy`] is an enum
+//! precisely because a host table and a mount table are answers to different
+//! questions, and a door silently honouring one while the operator configured
+//! both is how a request reaches the wrong service. An inner door is a
+//! separate process from the outer one (see [`passway::path_route`]).
+//!
+//! Everything else on this page composes normally — an inner door is plain
+//! HTTP on loopback or the mesh, so it typically runs with no ACME, no
+//! `PASSWAY_TLS_MODE=acme`, and no `:80` redirect tier. What nests is the
+//! routing table, not the cryptography.
+//!
 //! @yah:relay(R853, "R779 outward actions: publish the pingora fork upstream, put the demux on :443 in front of the live origins, and settle the ACME order budget")
 //! @yah:at(2026-09-03T06:33:30Z)
 //! @yah:status(open)
@@ -316,9 +364,31 @@
 //! @yah:verify("clippy on Linux (where the module actually compiles — on darwin it is cfg'd out and clippy never sees it): zero warnings from socket_activation.rs and zero from the test binary. The 3 remaining passway lib warnings are pre-existing and not from this ticket.")
 //! @yah:verify("Formatting deliberately NOT run. `cargo fmt --all -- --check` reaches through path deps into oss/cheers, which is how 827 uncommitted lines were destroyed here on 2026-08-28; and the passway crate has never been fmt-clean (36 diffs in acme.rs alone). Checked instead that this ticket adds no new debt: src/socket_activation.rs does not appear in `cargo fmt -p passway --check` output at all, and the diffs near my edits are pre-existing lines.")
 //! @yah:gotcha("Adoption is Linux-only now and the tests say so in their headers. If passway ever needs socket activation on another platform, the ONLY route is adding an fd-adoption API to pingora upstream — seed_listen_fd is cfg(unix), the upgrade socket is cfg(target_os = \\\"linux\\\"). The prepared hunks for that PR lived in patches/, deleted 2026-09-05 on R853-T1; recover them with `git show be2680f4:oss/passway/patches/pingora-main-seed-listen-fds.patch` (rebased onto cloudflare/pingora main 09696b51, tests+fmt verified) rather than rewriting from scratch. Note the rebase rots — regenerate if main has moved.")
+//!
+//! @yah:ticket(R870-T18, "Wire R870-F15's PathRouter into passway's real config surface (CLI/env/file) and the service.toml+domain-manifest join")
+//! @yah:status(review)
+//! @yah:at(2026-09-09T08:26:20Z)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:parent(R870)
+//! @yah:next("R870-F15 built and fully unit/integration-tested the mechanism: passway::path_route::{PathRouter, MountSource, build_path_router, mount_from_component}, PassProxy::path_routed(), segment-aware longest-prefix matching reusing crate::path::prepare_auth_path, config-load rejection of duplicate/malformed mounts, per-mount response headers via a new response_filter. What is NOT built: any way to actually configure a live passway BINARY with a PathRouter. main.rs today only builds RoutingStrategy::ByHost from PASSWAY_UPSTREAMS/PASSWAY_YUBABA_IDENT/yubaba-URL grammars; there is no CLI/env/file surface that calls PassProxy::path_routed at all.")
+//! @yah:next("DELIBERATELY NOT invented in F15: an env-var or file grammar for the mount table + per-mount headers. The established idiom for a hand-maintained, headers-bearing route table in this crate is a FILE (see /etc/passway-demux.routes, /etc/passway-http-router.routes — both explicitly headed 'hand-maintained until X takes over'), not a comma-separated env var like PASSWAY_UPSTREAMS. Inventing a throwaway env-var grammar now, only to redesign it once the real consumer (whatever renders service.toml + .yah/domains/<zone>.toml into the inner door's config) is built, is exactly the shim CLAUDE.md's 'below v1.0.0: break it, don't tape it' section warns against — a format that looks careful in the diff and is wrong three months later.")
+//! @yah:next("BLOCKED ON / SHOULD BE SEQUENCED WITH: R870-B11 (bundle tier: one workload per service, still open as of this ticket) — B11 decides the mount-naming convention on the bundle-assembly side (mesofact_bundle::assemble::collect_component_files already uses 'app' for /app, None for root; path_route::mount_from_component already translates that to passway's '/app'/'' convention, so the seam is at least named). Whoever builds the actual service.toml+domain-manifest join should decide the file format together with this ticket, not before it — the two are the same design question (what does the inner door read at startup) asked from two sides.")
+//! @yah:next("CONCRETE NEXT STEPS: (1) decide the config surface — a TOML file `PASSWAY_PATH_ROUTES_FILE` in the demux-routes idiom is the leading candidate, mapping mount -> upstream addr(s) -> header list; (2) wire it into main.rs alongside the existing three upstream-source grammars, calling passway::path_route::build_path_router + PassProxy::path_routed; (3) build the actual join in whatever renders the inner door's config from service.toml + .yah/domains/<zone>.toml (likely yubaba/kamaji-side, not passway itself); (4) enforce 'a service with ONE component gets NO inner tier at all' and 'a component cannot be both bundle-staged (R870-B11 config 1) and its own workload' at the config-generation/admission layer, not in passway (passway just proxies whatever PathRouter it's handed).")
+//! @yah:gotcha("The live gates in R870-F15's verify list (curl against a real deployed two-component service on a real hostname) could not be run without this ticket's config surface existing — there is no way to launch a real inner-door passway process yet. F15 substituted a full in-process integration-test suite (tests/path_routing.rs, real TCP, real pingora Server, real fake upstreams) exercising the same behaviors (split serving, segment safety, header ownership, 503-not-404) at the mechanism level.")
+//! @yah:handoff("THE FORMAT DECISION, which is this ticket's real deliverable. The config surface is a FILE named by PASSWAY_PATH_ROUTES_FILE, holding JSON, parsed by the new oss/passway/crates/passway/src/path_routes_file.rs. FILE, not an env var: F15's reasoning is adopted unchanged — a mount carries an upstream SET and a header MAP, two nesting levels, and PASSWAY_UPSTREAMS-style grammars carry one scalar per key; a headers-bearing route table in this crate is already a file (/etc/passway-demux.routes, /etc/passway-http-router.routes). JSON, NOT the TOML F15 named as leading candidate — a deliberate departure with three checkable reasons. (1) `toml` appears ZERO times in oss/passway/Cargo.lock (grepped, not assumed), so TOML here means adding a config-language parser and ~7 transitive crates to a trust-boundary crate whose manifest justifies every dependency by name; serde_json is already a direct dep. (2) It is the encoding this seam already speaks: passway already consumes control-plane output from yah as JSON in discovery.rs (yubaba /service-records). (3) The demux-routes precedent has two halves — file-vs-env-var, and hand-maintained. The first applies and is honoured; the second does not: both of those files are literally headed \"hand-maintained until X takes over\", and this table is generated by the service.toml + domain-manifest join from day one with no interim hand-authored phase. The shape is a plain serde struct, so if a later consumer makes hand-authoring dominant the encoding is a one-call swap and the schema survives it.")
+//! @yah:handoff("DECIDED TOGETHER WITH (3), AS INSTRUCTED — the format is shaped by what the join can produce, not by what was convenient to parse. Each route is {mount, upstreams[], headers{}} because that is exactly what the join yields: mount from path_route::mount_from_component(component.mount) (already the ONE translation site), headers from the DomainRoute whose route_path_prefix(path) equals normalize_mount(component.mount) — a pairing CloudConfig::cross_ref_validate already PROVES agrees (oss/yubaba/crates/cloud/src/config.rs:1688-1725), so the join cannot silently mismatch — and upstreams from the deployed unit's address, the one placement-time value. Nothing per-mount for TLS/SNI was added: MountSource::opts already falls back to the proxy-wide default and an inner door talks plain HTTP to its upstreams, so a per-mount scheme would have been speculative. schema_version is REQUIRED and anything but 1 is a boot failure naming both numbers — not a compatibility shim: producer and consumer are separately released, so a rolling upgrade genuinely sees two versions at once, which is the one case CLAUDE.md's below-v1.0.0 rule says to sequence for. deny_unknown_fields for the same reason: drift in a ROUTING table must fail at boot, never serve half of what was intended.")
+//! @yah:handoff("WHAT LANDED. (a) NEW oss/passway/crates/passway/src/path_routes_file.rs — PathRoutesFile/PathRouteEntry (serde, deny_unknown_fields), parse() + into_mount_sources() + load(), ROUTES_FILE_ENV, SCHEMA_VERSION, 8 unit tests. It validates only what the router cannot see (schema_version, empty table, mount with no upstream, unresolvable address); mount well-formedness and duplicate mounts are left to PathRouter::new so there is exactly ONE validator, which is path.rs's divergent-normalizer rule applied at the config boundary. (b) main.rs: new path_routes_from_env() + HOST_ROUTING_ENV, read BEFORE build_upstream_sources (which panics on a half-set discovery config and must not run under path routing); the strategy is now selected by one match that calls either build_path_router+PassProxy::path_routed or build_host_router+PassProxy::routed — both arms return the same GenBackgroundService list, so the server wiring below is untouched. Setting PASSWAY_PATH_ROUTES_FILE alongside PASSWAY_UPSTREAM_SOURCE/PASSWAY_UPSTREAMS/PASSWAY_YUBABA_URL/PASSWAY_YUBABA_IDENT is a boot failure naming both halves, not a merge — one proxy is one RoutingStrategy. (c) lib.rs re-exports; the module-doc env table gains PASSWAY_PATH_ROUTES_FILE and a new \"The inner door\" section; crates/passway/README.md gains the row, a worked example and the library-surface bullet.")
+//! @yah:handoff("SCOPE ITEMS 3 AND 4 ARE FILED, NOT HALF-BUILT — R870-F23, per this ticket's own escape clause. The criterion it names (\"a different crate, a different release cadence\") is met twice: the consumer is oss/passway (independently versioned, own export mirror) while the producer is oss/yubaba + oss/yah-base + oss/kamaji; and more decisively, nothing can reach a live inner door because there is NO WORKLOAD KIND for one — WorkloadSpec carries typed per-kind carriers (MesofactServeBundle, oss/yah-base/crates/workload-spec/src/lib.rs:1437) and an inner passway needs its own plus a kamaji-allocated port, a routes file materialized node-side, and a slot in the deploy sequence. A planner nothing calls is exactly the half-build this ticket forbade. Admission rule (4a) \"one component gets NO inner tier\" is specified in F23 as a by-construction property of the planner (Option<InnerDoorPlan>, None below two independently-deployed units) so the negative is assertable on ABSENCE. Rule (4b) \"not both bundle-staged and its own workload\" is NOT EXPRESSIBLE TODAY and I checked rather than assumed: [providers.bundle] is a per-MIRROR slot, not per-component, so no config can currently say \"give this one component its own workload\". R870-B11 already landed the expressible half in cross_ref_validate; F23 says to extend that same loop in the commit that mints the vocabulary, rather than filing a parallel guard.")
+//! @yah:gotcha("FOUND WHILE BUILDING THIS, carried to R870-F23 because it is an operator call rather than a coding one: passway ALWAYS terminates TLS on its listener. TlsMode has exactly two variants, Manual and Acme (oss/passway/crates/passway/src/tls.rs:215), and main() unconditionally calls add_tls_with_settings. So an inner door on loopback still needs a cert on disk and the outer door still needs PASSWAY_UPSTREAM_TLS=true plus an SNI to reach it. It WORKS — tests/path_routes_file.rs drives exactly that shape with an rcgen self-signed leaf — but the \"cheap inner tier\" then costs a cert, a renewal story and a loopback TLS handshake per request. A plaintext listener mode is the obvious fix and was deliberately not taken here: giving a public-facing trust-boundary door a cleartext mode is a security decision whose blast radius is past this ticket. It changes what F23's workload spec has to carry, so decide it before building the supervisor.")
+//! @yah:verify("THE GATE R870-F15 COULD NOT RUN, and it now runs: NEW oss/passway/crates/passway/tests/path_routes_file.rs forks a REAL passway binary (CARGO_BIN_EXE_passway) configured only by PASSWAY_PATH_ROUTES_FILE, over its own TLS listener, against two independent tagged upstream processes. a_forked_passway_configured_by_file_serves_two_mounts_on_one_hostname asserts / reaches the site upstream, /app/ reaches the app upstream, /application falls to the ROOT mount (the naive-startsWith bug, now disproven against a live listener rather than in-process), and the /app mount's COOP+COEP land on /app/'s responses and are ABSENT from /'s. a_door_configured_with_both_strategies_refuses_to_start and a_door_pointed_at_an_unreadable_table_refuses_to_start assert the two boot refusals by exit status and by the refusal text naming the variables. Registered in tests/main.rs's mod list (autotests = false, so an unlisted file is silently dark).")
+//! @yah:verify("SUITE: cargo test --manifest-path oss/passway/Cargo.toml -p passway = 197 lib + 43 bin + 35 integration = 275 passed, 0 failed, against the 258/0 baseline (183+43+32) I measured myself at the start of this session. Delta accounted for by name, not by arithmetic: +8 lib are mine (path_routes_file's unit tests), +3 integration are mine, and +6 lib came from a PEER's tls.rs ALPN work that landed in sync commit e714a29f mid-session (git show e714a29f -- .../tls.rs counts 6 added #[test]). cargo check -p passway --all-targets clean. Two PostToolUse tree-drift warnings fired during those runs; the files they named were app/yah/cli/src/cloud.rs, oss/yubaba/crates/yubaba/{main,lib}.rs and crates/yah/plugin/* — none in oss/passway — so the results stand.")
+//! @yah:verify("NOT RUN, stated plainly: nothing was rolled to the three live doors (the dispatch forbade it), so no live curl gate was exercised. The live gates that remain are R870-F23's, and they need the inner-door workload kind that ticket exists to build. SHARED-TREE NOTE for the reviewer: @Miravel:? holds R870-F16, which also edits oss/passway/crates/passway/src/main.rs (PASSWAY_YUBABA_TIMEOUT_SECS / PASSWAY_UPDATE_INTERVAL_SECS defaults). My edits there are confined to four regions — the module-doc env table row, a new \"The inner door\" doc section appended after the R858-T1 section, the new path_routes_from_env()/HOST_ROUTING_ENV pair inserted immediately above build_upstream_sources, and the strategy match in main() replacing the single build_host_router call. Nothing in the discovery-timeout or update-interval code was touched.")
+//! @yah:handoff("SHIPPED scope items 1 and 2 in full (config surface decided + wired into a real binary, proven by forking one); scope items 3 and 4 filed as R870-F23 with the format, the join and both admission rules specified, per this ticket's own \"different crate, different release cadence\" escape clause. The four preceding @yah:handoff entries carry the format rationale, the (1)-with-(3) co-design, the landed diff and the filing argument; the @yah:gotcha carries the one design wrinkle found in-pass (passway always terminates TLS, so a loopback inner door still needs a cert — an operator call, carried to F23).")
+//! @yah:verify("LEADER RE-VERIFICATION (session:abde2cbb, 2026-09-09), independent of the courier. Suite: `cargo test --manifest-path oss/passway/Cargo.toml -p passway` = 197 lib + 43 + 35 integration = 275 passed / 0 failed, matching the courier's count against the 258/0 baseline I measured earlier. CHECKED THE FORMAT DEVIATION RATHER THAN ACCEPTING IT, because the ticket named TOML as its leading candidate and the courier shipped JSON: `grep -c '^name = \"toml\"' oss/passway/Cargo.lock` returns **0**, and serde_json is a direct dependency of the passway crate. So the deviation's premise is exactly right — choosing TOML would have added a whole config-language parser to a crate that sits on a trust boundary, to express a table that is generated rather than hand-written, while JSON is already what this yah-to-passway seam speaks in discovery.rs. That is a better answer than the one the ticket suggested, arrived at by reading the lockfile rather than by preference, and it is the right call. The second half of the demux-routes precedent (\"hand-maintained until X takes over\") genuinely does not transfer to a table the join emits from day one. A PostToolUse tree-drift warning fired naming oss/yubaba/crates/yubaba-test-harness/src/lib.rs — a peer's file, not on passway's path, so the result stands.")
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -331,10 +401,12 @@ use passway::acme::{self, AcmeConfig};
 use passway::auth::{CheersAuth, RouteAuthPolicy};
 use passway::discovery::{YubabaDiscoveryConfig, YubabaUpstreams};
 use passway::idle::{IdleReaper, IdleTracker};
+use passway::path_route::{build_path_router, MountSource};
+use passway::path_routes_file::ROUTES_FILE_ENV;
 use passway::proxy::PassProxy;
 use passway::redirect;
 use passway::routing::{build_host_router, HostKey, UpstreamOpts, UpstreamSet, CATCH_ALL_LABEL};
-use passway::tls::{build_tls_settings, TlsMode};
+use passway::tls::{build_tls_settings, parse_alpn_policy, TlsMode};
 use passway::upstream::{StaticUpstreams, UpstreamSource};
 
 fn env_or(key: &str, default: &str) -> String {
@@ -394,6 +466,36 @@ fn env_secs(key: &str, default: u64) -> Duration {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(default);
     Duration::from_secs(v)
+}
+
+/// Where one hostkey's discovery cache lives, or `None` when
+/// `PASSWAY_DISCOVERY_CACHE` is unset and persistence is off (R870-F4).
+///
+/// The env var names a DIRECTORY rather than a file because the file has to be
+/// per hostkey — one process fronts several hostnames, each with its own ident
+/// and its own backend set, and a single shared path would have them overwrite
+/// each other on every tick. Point it at the per-instance state dir the door
+/// already owns (`/var/lib/passway-<name>/`), which is where its cert, key and
+/// ACME account cache already live.
+fn discovery_cache_path(key: &HostKey) -> Option<PathBuf> {
+    let dir = std::env::var("PASSWAY_DISCOVERY_CACHE").ok()?;
+    let stem = match key {
+        HostKey::CatchAll => "_catchall".to_string(),
+        // Hostnames are already restricted to letters, digits, `-` and `.`, but
+        // this is a path built from configuration, so it is sanitized rather
+        // than trusted.
+        HostKey::Host(h) => h
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect(),
+    };
+    Some(PathBuf::from(dir).join(format!("discovery-{stem}.json")))
 }
 
 /// Parse `PASSWAY_UPSTREAMS` into one address list per fronted hostname
@@ -802,6 +904,64 @@ fn merge_static_over_discovered(
     }
 }
 
+/// The host-routed grammars, by name — everything an inner door must NOT also
+/// be configured with. Kept as one list so [`path_routes_from_env`]'s refusal
+/// and this file's env table cannot drift apart.
+const HOST_ROUTING_ENV: [&str; 4] = [
+    "PASSWAY_UPSTREAM_SOURCE",
+    "PASSWAY_UPSTREAMS",
+    "PASSWAY_YUBABA_URL",
+    "PASSWAY_YUBABA_IDENT",
+];
+
+/// The R870-T18 config surface: `PASSWAY_PATH_ROUTES_FILE` names this door's
+/// mount table, and setting it makes this process a service's own inner door
+/// (`RoutingStrategy::ByPath`) instead of a host-routed one.
+///
+/// `None` = the variable is unset or empty, so nothing changes and
+/// [`build_upstream_sources`] decides as it did before.
+///
+/// Two refusals, both loud at boot for the same reason a bad
+/// `PASSWAY_UPSTREAM_SOURCE` is: a routing misconfiguration that starts
+/// anyway serves *something*, and the something is another component's
+/// content.
+///
+/// 1. **Both strategies configured.** One proxy is one
+///    [`passway::proxy::RoutingStrategy`]; merging a host table with a mount
+///    table has no defined meaning, and picking one silently means the
+///    operator's other half is dead config.
+/// 2. **An unreadable or invalid table.** Refused whole, never
+///    partially — see [`passway::path_routes_file`].
+fn path_routes_from_env() -> Option<Vec<MountSource>> {
+    let path = std::env::var(ROUTES_FILE_ENV).ok().map(|p| p.trim().to_string());
+    let path = path.filter(|p| !p.is_empty())?;
+
+    let also_set: Vec<&str> = HOST_ROUTING_ENV
+        .iter()
+        .copied()
+        .filter(|key| std::env::var(key).is_ok_and(|v| !v.trim().is_empty()))
+        .collect();
+    if !also_set.is_empty() {
+        panic!(
+            "{ROUTES_FILE_ENV} is set (path routing) but so is {also_set:?} (host routing). \
+             One passway is one routing strategy — a service's own inner door is a separate \
+             process from the host-routed door in front of it. Unset one."
+        );
+    }
+
+    let sources = passway::path_routes_file::load(std::path::Path::new(&path))
+        .unwrap_or_else(|e| panic!("invalid {ROUTES_FILE_ENV}: {e}"));
+    log::info!(
+        "passway is PATH-routed (inner door) from {path}: {} mount(s) {:?}",
+        sources.len(),
+        sources
+            .iter()
+            .map(|s| if s.mount.is_empty() { "/" } else { s.mount.as_str() })
+            .collect::<Vec<_>>()
+    );
+    Some(sources)
+}
+
 /// Pick the [`UpstreamSource`]s from `PASSWAY_UPSTREAM_SOURCE` (R594-F8),
 /// one per fronted hostname (R594-F10), each carrying its own upstream scheme
 /// (R858-T1).
@@ -939,6 +1099,13 @@ fn build_upstream_sources(tls: &HostScoped<bool>, sni: &HostScoped<String>) -> V
                                 base_urls,
                                 ident: discovered.get(&key).cloned().unwrap_or_default(),
                                 timeout: env_secs("PASSWAY_YUBABA_TIMEOUT_SECS", 5),
+                                // Per hostkey, not per process: one door can
+                                // front several hostnames and each has its own
+                                // ident and therefore its own backend set. A
+                                // shared file would have them overwrite each
+                                // other every tick.
+                                cache_path: discovery_cache_path(&key),
+                                cache_max_age: env_secs("PASSWAY_DISCOVERY_CACHE_MAX_AGE_SECS", 300),
                             };
                             log::info!(
                                 "upstream discovery for {key:?}: polling {:?} for records of \
@@ -1009,6 +1176,12 @@ fn main() {
     let listen = env_or("PASSWAY_LISTEN", "0.0.0.0:443");
     let cert_path = std::env::var("PASSWAY_TLS_CERT").expect("PASSWAY_TLS_CERT is required");
     let key_path = std::env::var("PASSWAY_TLS_KEY").expect("PASSWAY_TLS_KEY is required");
+
+    // R870-T21. Parsed HERE, before the ACME bootstrap below, because that can
+    // block for minutes on a first-boot issuance — a mistyped ALPN offer must
+    // fail in the first second, not after a cert order.
+    let alpn_policy = parse_alpn_policy(|k| std::env::var(k).ok())
+        .unwrap_or_else(|e| panic!("invalid ALPN configuration: {e}"));
 
     let acme_config: Option<AcmeConfig> =
         acme::parse_acme_config(|k| std::env::var(k).ok(), cert_path.clone(), key_path.clone())
@@ -1092,7 +1265,15 @@ fn main() {
         .unwrap_or_else(|e| panic!("invalid PASSWAY_UPSTREAM_TLS: {e}"));
     let upstream_sni = parse_upstream_sni(&env_or("PASSWAY_UPSTREAM_SNI", ""))
         .unwrap_or_else(|e| panic!("invalid PASSWAY_UPSTREAM_SNI: {e}"));
-    let upstream_sources = build_upstream_sources(&upstream_tls, &upstream_sni);
+    // R870-T18: `PASSWAY_PATH_ROUTES_FILE` selects the strategy, so it is read
+    // FIRST — under path routing the host-routed grammars are refused rather
+    // than parsed, and `build_upstream_sources` (which panics on a half-set
+    // discovery config, and warns on an empty static one) must not run at all.
+    let path_route_sources = path_routes_from_env();
+    let upstream_sources = match path_route_sources {
+        Some(_) => Vec::new(),
+        None => build_upstream_sources(&upstream_tls, &upstream_sni),
+    };
     let health_check_interval = env_secs("PASSWAY_HEALTH_CHECK_INTERVAL_SECS", 5);
     let update_interval = env_secs("PASSWAY_UPDATE_INTERVAL_SECS", 30);
 
@@ -1204,14 +1385,28 @@ fn main() {
     }
 
     // One health-checked, round-robin load balancer per fronted hostname
-    // (R594-F10). Every returned background service must be added to the
-    // server below, or its set's discovery/health timers never fire.
-    let (router, lb_services) =
-        build_host_router(upstream_sources, health_check_interval, update_interval);
+    // (R594-F10) — or per MOUNT, for a path-routed inner door (R870-T18).
+    // Every returned background service must be added to the server below, or
+    // that set's discovery/health timers never fire. Both arms return the same
+    // `GenBackgroundService<LoadBalancer<RoundRobin>>` list precisely because
+    // the two strategies share every piece below the routing key.
+    let (routing, lb_services) = match path_route_sources {
+        Some(sources) => {
+            let (router, services) =
+                build_path_router(sources, health_check_interval, update_interval)
+                    .unwrap_or_else(|e| panic!("invalid {ROUTES_FILE_ENV}: {e}"));
+            (PassProxy::path_routed(router), services)
+        }
+        None => {
+            let (router, services) =
+                build_host_router(upstream_sources, health_check_interval, update_interval);
+            (PassProxy::routed(router), services)
+        }
+    };
 
     // The bare-form globals become the proxy-wide default, applied to every
     // set that declared no override of its own (R858-T1).
-    let mut proxy = PassProxy::routed(router).with_upstream_tls(
+    let mut proxy = routing.with_upstream_tls(
         upstream_tls.global.unwrap_or(false),
         upstream_sni.global.unwrap_or_default(),
     );
@@ -1219,6 +1414,42 @@ fn main() {
         proxy = proxy.with_auth(auth, policy);
     }
     proxy = proxy.with_health_path(env_or("PASSWAY_HEALTH_PATH", "/health"));
+
+    // R870-F8: per-domain holding pages, loaded once here so the door is
+    // branded from its first 503 rather than from the first reload, then kept
+    // fresh by a watcher. Unset = every authority gets the built-in page.
+    let mut holding_watcher = None;
+    if let Some(dir) = std::env::var("PASSWAY_HOLDING_DIR")
+        .ok()
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+    {
+        let dir = PathBuf::from(dir);
+        let pages = passway::holding::shared(passway::holding::HoldingPages::load(&dir));
+        let loaded = passway::holding::current(&pages);
+        log::info!(
+            "passway holding overrides: {} host(s) over {} page(s) from {}",
+            loaded.hosts(),
+            loaded.pages(),
+            dir.display()
+        );
+        let reload = Duration::from_secs(
+            std::env::var("PASSWAY_HOLDING_RELOAD_SECS")
+                .ok()
+                .map(|v| {
+                    v.trim()
+                        .parse()
+                        .expect("PASSWAY_HOLDING_RELOAD_SECS must be an integer number of seconds")
+                })
+                .filter(|s| *s > 0)
+                .unwrap_or(passway::holding::DEFAULT_RELOAD_SECS),
+        );
+        proxy = proxy.with_holding_pages(pages.clone());
+        holding_watcher = Some(background_service(
+            "passway holding pages",
+            passway::holding::HoldingWatcher::new(dir, pages, reload),
+        ));
+    }
 
     // R779: idle self-reap for the kamaji JIT tier. Unset = never exit on
     // idle (a standalone passway must stay up).
@@ -1235,7 +1466,7 @@ fn main() {
     }
 
     let mut proxy_service = pingora::proxy::http_proxy_service(&server.configuration, proxy);
-    let tls_settings = build_tls_settings(&tls_mode)
+    let tls_settings = build_tls_settings(&tls_mode, alpn_policy)
         .expect("failed to build TLS settings — check PASSWAY_TLS_CERT / PASSWAY_TLS_KEY");
     proxy_service.add_tls_with_settings(&listen, None, tls_settings);
 
@@ -1245,6 +1476,9 @@ fn main() {
     }
     if let Some(reaper) = idle_reaper {
         server.add_service(reaper);
+    }
+    if let Some(watcher) = holding_watcher {
+        server.add_service(watcher);
     }
     if let Some(bind) = redirect_bind {
         let redirect_service =

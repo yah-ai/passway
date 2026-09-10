@@ -53,6 +53,13 @@ tokio = { version = "1", features = ["sync", "time"] }
 # promotes it to a real dependency rather than adding a new one).
 x509-parser = "0.18"
 
+# R853-F4 — `Der`, the DER-bytes newtype `instant_acme::CertificateIdentifier::new`
+# takes for the ARI authority-key-identifier and serial. Nothing else from this
+# crate is used: it is a type-level handshake with `instant-acme`, which depends
+# on it directly (>=1.1.0) and resolves to the same 1.x already in this graph via
+# rustls, so the identifier we build is the identifier it serializes.
+rustls-pki-types = "1.1"
+
 # R779-P8 — only the DNS-01 delegation integration test
 # (`tests/pebble_dns01_delegation.rs`) needs these; none reaches the library.
 # Real versions, never `"*"`: `deny.toml` sets `bans.wildcards = "deny"`.

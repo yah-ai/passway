@@ -25,6 +25,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use passway::auth::{CheersAuth, RouteAuthPolicy};
+use passway::path_route::{build_path_router, MountSource};
 use passway::proxy::PassProxy;
 use passway::routing::{build_host_router, HostKey, UpstreamSet};
 use passway::upstream::{build_load_balancer, StaticUpstreams, UpstreamSource};
@@ -192,6 +193,44 @@ pub fn build_host_routed_proxy(
         Duration::from_millis(100),
     );
     (PassProxy::routed(router), services)
+}
+
+/// One mount's test config: `(mount, addrs, headers)`. `mount` uses this
+/// crate's convention (`""` for root, `"/app"` for a sub-mount — see
+/// `passway::path_route::mount_from_component`).
+pub type MountConfig<'a> = (&'a str, Vec<SocketAddr>, Vec<(&'a str, &'a str)>);
+
+/// Build a path-routed `PassProxy` (R870-F15): one static upstream set per
+/// mount, each with its own load balancer and background service — the
+/// inner-door shape, dispatching between one service's own components. Same
+/// fast 100ms health/update ticks as [`build_proxy`].
+pub fn build_path_routed_proxy(mounts: Vec<MountConfig>) -> (
+    PassProxy,
+    Vec<
+        pingora::services::background::GenBackgroundService<
+            pingora::lb::LoadBalancer<pingora::lb::selection::RoundRobin>,
+        >,
+    >,
+) {
+    let sources: Vec<MountSource> = mounts
+        .into_iter()
+        .map(|(mount, addrs, headers)| {
+            MountSource::new(mount, Arc::new(StaticUpstreams::new(addrs)) as Arc<dyn UpstreamSource>)
+                .with_headers(
+                    headers
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                )
+        })
+        .collect();
+    let (router, services) = build_path_router(
+        sources,
+        Duration::from_millis(100),
+        Duration::from_millis(100),
+    )
+    .expect("valid mount table");
+    (PassProxy::path_routed(router), services)
 }
 
 /// Like [`build_proxy`], but with cheers-verify edge auth wired in via

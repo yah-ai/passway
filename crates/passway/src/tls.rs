@@ -15,8 +15,11 @@
 //! 0.8.1's source: `pingora-core/src/listeners/tls/rustls/mod.rs`,
 //! `TlsSettings::build` calls `pingora_rustls::load_certs_and_key_files`
 //! then `ServerConfig::builder_with_protocol_versions(&[TLS12, TLS13])`).
-//! `enable_h2()` sets ALPN to prefer HTTP/2 with HTTP/1.1 as fallback,
-//! satisfying V0 MUST #1's "HTTP/1.1+HTTP/2 on a TLS listener".
+//! [`AlpnPolicy::H2AndHttp11`] — the default — sets ALPN to prefer HTTP/2
+//! with HTTP/1.1 as fallback, satisfying V0 MUST #1's "HTTP/1.1+HTTP/2 on a
+//! TLS listener". R870-T21 made it opt-OUT per door
+//! ([`AlpnPolicy::Http11Only`], `PASSWAY_ALPN=http/1.1`) for a door fronting
+//! a protocol that cannot exist over HTTP/2 at all; see [`AlpnPolicy`].
 //!
 //! ## Why `TlsMode::Acme` builds identical `TlsSettings` to `Manual`
 //!
@@ -200,8 +203,12 @@
 //! @yah:handoff("WIDER THAN THE TITLE — four discovered fixes, all in this pass. (a) THE SIGNAL CONTRACT WAS WRONG and had been since R594-F7: both tls.rs and main.rs said the supervisor SIGQUITs 'once the new process is up (past server.bootstrap())', which is impossible — bootstrap() is where the replacement blocks waiting to receive. The real trigger is 'has bound upgrade_sock', and the window is ~5s (MAX_RETRY 5 x RETRY_INTERVAL 1s, then Bootstrap exit(1)s). Corrected at both sites; the helper waits on the socket path, which pingora creates on entry and unlinks on both exits. (b) yubaba cert_materialize.rs: RELOAD_CMD_ENV's doc said 'e.g. systemctl restart passway' — now says reload, and why. (c) THE RELEASE RAIL carries the helper: publish-yubaba-release.sh stages it (the one non-ELF member, outside the ELF assertion loop) + layout assertion; control_plane_install.{sh,rs} install it on its own conditional with a rollback anchor and a content assertion; roll-node.sh keys and asserts its hash like every other member. The DROP-IN deliberately does not ride the roll — it lands in /etc/systemd/system/&lt;unit&gt;.service.d/, the unit name differs per door, and a roll must never rewrite a door's unit configuration; two tests hold that split. (d) roll-node.sh's and control_plane_install.sh's operator-facing text said a restart is the only activation verb; both now name the reload.")
 //! @yah:verify("cargo test -p yah --test main camp_systemd_unit_emit = 13 passed (4 new: the drop-in's four directives; the helper's step ORDER — spawn &lt; wait-for-socket &lt; SIGQUIT &lt; wait-for-MainPID; the ships-in-tarball/drop-in-is-node-state split; and the four refusal paths run as a real `sh` process). cargo test --manifest-path oss/yah-base/Cargo.toml -p yah-workload-spec --lib control_plane_install = 12 passed (1 new). cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib cert_materialize = 8 passed. `sh -n` + shellcheck -s sh on the helper: clean. `bash -n` on roll-node.sh and publish-yubaba-release.sh: clean; shellcheck on both reports only pre-existing SC2012/SC2029/SC3040/SC3043 in hunks this pass never touched.")
 //! @yah:verify("THE LIVE REHEARSAL, not run, so whoever holds the authorization does not re-derive it. On ONE door, in a window where a blip is acceptable: (1) roll the node so /usr/local/bin/passway-graceful-upgrade and the new passway are present; (2) confirm the door's env pins PASSWAY_UPGRADE_SOCK to a per-instance path — unset it is pingora's shared /tmp/pingora_upgrade.sock and every door runs two passways; (3) install app/yah/cli/resources/passway-graceful-upgrade.conf as /etc/systemd/system/&lt;unit&gt;.service.d/, `systemctl daemon-reload`, then ONE `systemctl restart &lt;unit&gt;` and watch `journalctl -u &lt;unit&gt; -f` for 'passway: notified systemd READY with MAINPID=&lt;pid&gt;' within a second of the listener line — if it is absent, remove the drop-in and daemon-reload before debugging rather than leaving a front door restart-looping; (4) THE ACTUAL TEST: start a slow request against the door (`curl --limit-rate` or a long download), run `systemctl reload &lt;unit&gt;`, and assert three things — the in-flight request completes, no connection is refused during the swap, and `systemctl show -p MainPID` names a NEW pid while `systemctl is-active` stayed active throughout. (5) Only then set YUBABA_CERT_FILES_RELOAD_CMD=`systemctl reload &lt;unit&gt;` in that node's yubaba drop-in.")
+//! @yah:gotcha("THE DROP-IN'S OWN PRECONDITION UNDERCOUNTED THE PASSWAYS — corrected in the file 2026-09-08 by @Ashguard:coffee (R600-F10, session:c431ac51), who is a consumer of this conf rather than its author. app/yah/cli/resources/passway-graceful-upgrade.conf said an unset PASSWAY_UPGRADE_SOCK is contended by \"two passways — every live door runs the apex one plus passway-mesh\". It is THREE. Measured, not reasoned: `systemctl list-units --type=service --all \"passway*\"` on us-east-001 (debian@51.81.85.145) returns passway-demux.service, passway-mesh.service AND passway-test.service, all active/running. passway-demux is the one the text missed. So the shared /tmp/pingora_upgrade.sock is contended three ways and a reload is correspondingly likelier to hand its listeners to the wrong process. The conf now says so and tells the installer to COUNT rather than trust the number — south was not counted and must not be assumed to match east. ALSO MEASURED IN THE SAME PASS: there is no /etc/systemd/system/passway*.service.d directory on us-east-001 at all, so no door on that node carries this drop-in and every activation there is still a connection-dropping `systemctl restart`. @Ashguard:libra hit that firsthand during the 2026-09-08 mesh recovery — repointing the mesh doors dropped connections precisely because this conf is not installed on them. The mesh doors are a demonstrated customer for it, not a hypothetical one.")
+//! @yah:verify("ACTIVATED AND PROVEN ON BOTH LIVE DOORS 2026-09-08 by @Ashguard:dragon. Drop-in installed at /etc/systemd/system/passway-test.service.d/ (east) and /etc/systemd/system/passway.service.d/ (south); one connection-dropping restart each, both came up Type=notify clean (\"notified systemd READY with MAINPID\"), ACME skipped issuance (cert fresh). Then a REAL reload under load on south: 120 sequential https://yah.dev/ requests against 127.0.0.1:443 while `systemctl reload passway.service` ran. Result 119x200 / 1x503, MainPID 2809164 -> 2809418, unit stayed active. Journal shows the handover working exactly as designed: \"Trying to send socks\" -> \"listener sockets sent\" -> replacement listening on /run/passway-test-upgrade.sock -> SIGQUIT to the old pid -> \"passway.service main pid is now 2809418; 2809164 is draining\". Upgrade socks are pinned per-instance on both nodes (passway-test/passway = /run/passway-test-upgrade.sock, passway-mesh = /run/passway-mesh-upgrade.sock), so the three-way contention this ticket's conf warns about does not apply here.")
+//! @yah:gotcha("RELOAD IS ZERO-CONNECTION-DROP BUT NOT ZERO-ERROR: measured 1x503 in 120 requests across a reload on us-south-001, 2026-09-08. Not a torn handover — the listener transfer succeeded and no connection was refused or reset. The 503 comes from the REPLACEMENT process, which starts with an EMPTY upstream set: passway re-runs upstream discovery from scratch on every start (PASSWAY_UPSTREAM_SOURCE=yubaba, polling /service-records?ready=true for ident yah-marketing), so for roughly one second after it takes the socket it is serving with nothing healthy behind it. The old process has already had SIGQUIT by then, so there is nothing to fall back to. Consequence for the thing this drop-in exists for: every unattended cert rotation will emit a short 503 burst on that origin, which is much better than dropping connections but is NOT the \"costs nothing\" the conf header claims. The fix shape is to hold READY=1 / the socket handover until the first upstream health poll has produced at least one ready backend, i.e. make discovery part of the readiness gate rather than a background service started after it.")
 
 use pingora::listeners::tls::TlsSettings;
+use pingora::protocols::ALPN;
 
 /// How passway terminates TLS for its public listener.
 #[derive(Debug, Clone)]
@@ -222,18 +229,207 @@ pub enum TlsMode {
     Acme { cert_path: String, key_path: String },
 }
 
-/// Build a rustls-backed [`TlsSettings`] for `mode`, with HTTP/2 ALPN
-/// enabled (V0 MUST #1: HTTP/1.1 **and** HTTP/2 on the TLS listener).
+/// The env var a door sets to narrow its ALPN offer. See [`AlpnPolicy`].
+pub const ALPN_ENV: &str = "PASSWAY_ALPN";
+
+/// Which application protocols a door offers in the TLS handshake.
+///
+/// ## Why this is opt-OUT and not a uniform "always h2" (R870-T21)
+///
+/// HTTP/2 has no upgrade mechanism *at all*. RFC 9113 §8.2.2 forbids the
+/// `Connection` and `Upgrade` headers outright, so a protocol that is
+/// negotiated by an HTTP/1.1 `Upgrade:` handshake — Tailscale's TS2021
+/// (`Upgrade: tailscale-control-protocol`), and WebSocket's RFC 6455 form —
+/// **cannot be carried over an h2 connection**, no matter what passway does
+/// with hop-by-hop headers downstream of the handshake. There is no fallback
+/// once ALPN has picked `h2`: the request arrives at the upstream stripped of
+/// the very header that defines it.
+///
+/// That asymmetry cost real diagnosis time on 2026-09-09. It is not that an
+/// h2 client *fails* — it is that its failure is byte-for-byte
+/// indistinguishable from the three-day mesh outage R870-B14 had just fixed:
+/// the same `No Upgrade header in TS2021 request` line in headscale's stderr,
+/// the same 500. The A/B that settles it is per-origin `curl --http1.1` vs
+/// default; a rolling courier had to run it to discover its own probe was the
+/// thing generating the log lines it was using as the health signal.
+///
+/// So the door that grants meshes offers [`AlpnPolicy::Http11Only`]: a client
+/// there can only negotiate the one protocol TS2021 can actually use, and the
+/// ambiguous failure mode does not exist to be diagnosed. Every other door
+/// keeps the default — h2 is a real win for ordinary web traffic and nothing
+/// about this makes it wrong there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AlpnPolicy {
+    /// `h2` preferred, `http/1.1` accepted. The default, and correct for every
+    /// door fronting ordinary web traffic.
+    #[default]
+    H2AndHttp11,
+    /// `http/1.1` only. For a door fronting a protocol that only exists over
+    /// HTTP/1.1 — see this type's doc. An h2-only client is then refused
+    /// during the handshake (rustls answers `no_application_protocol`)
+    /// instead of reaching the upstream with its `Upgrade:` header gone.
+    Http11Only,
+}
+
+impl AlpnPolicy {
+    /// The pingora ALPN offer this policy installs on the listener.
+    pub fn alpn(self) -> ALPN {
+        match self {
+            AlpnPolicy::H2AndHttp11 => ALPN::H2H1,
+            AlpnPolicy::Http11Only => ALPN::H1,
+        }
+    }
+}
+
+/// Read [`ALPN_ENV`]. Unset or empty is [`AlpnPolicy::H2AndHttp11`], which is
+/// the pre-R870-T21 behaviour exactly.
+///
+/// Exactly two values are accepted, spelled as the ALPN protocol identifiers
+/// that go on the wire so the env file needs no glossary. An unrecognized
+/// value is a boot failure rather than a silent fallback to the default: a
+/// typo'd opt-out that quietly leaves h2 on is the failure this whole
+/// mechanism exists to remove.
+pub fn parse_alpn_policy(get: impl Fn(&str) -> Option<String>) -> Result<AlpnPolicy, String> {
+    let Some(raw) = get(ALPN_ENV).filter(|s| !s.trim().is_empty()) else {
+        return Ok(AlpnPolicy::default());
+    };
+    let normalized: Vec<String> = raw
+        .split(',')
+        .map(|p| p.trim().to_ascii_lowercase())
+        .filter(|p| !p.is_empty())
+        .collect();
+    match normalized
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["h2", "http/1.1"] => Ok(AlpnPolicy::H2AndHttp11),
+        ["http/1.1"] => Ok(AlpnPolicy::Http11Only),
+        _ => Err(format!(
+            "{ALPN_ENV} {raw:?}: expected `h2,http/1.1` (the default — leave it unset) or \
+             `http/1.1` (opt out of HTTP/2 on a door whose protocol needs an HTTP/1.1 \
+             `Upgrade:` handshake). Offering `h2` alone is deliberately not accepted: it \
+             refuses every ordinary HTTP/1.1 client."
+        )),
+    }
+}
+
+/// Build a rustls-backed [`TlsSettings`] for `mode`, offering the ALPN
+/// protocols `alpn` names (V0 MUST #1: HTTP/1.1 **and** HTTP/2 on the TLS
+/// listener — narrowed per door by R870-T21, see [`AlpnPolicy`]).
 ///
 /// `Manual` and `Acme` are handled identically here on purpose — see this
 /// module's doc for why the ACME automation can't and doesn't reach this
 /// function at all; it only ever sees "read this cert_path/key_path pair".
-pub fn build_tls_settings(mode: &TlsMode) -> pingora::Result<TlsSettings> {
+///
+/// @yah:ticket(R870-T21, "passway-mesh advertises h2 in ALPN, but TS2021 can only ever work over HTTP/1.1")
+/// @yah:status(review)
+/// @yah:at(2026-09-09T08:30:39Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R870)
+/// @yah:severity(low)
+/// @yah:next("DECIDE WHETHER THIS IS A BUG AT ALL - it may be correct HTTP/2 semantics rather than a defect, and that is the first question. Option A: leave it, document the h2/HTTP-1.1 asymmetry at the enable_h2 call site so the next diagnostician does not lose ten minutes to it. Option B: make h2 opt-out per door and disable it on passway-mesh, so a mesh client can only ever negotiate the protocol TS2021 actually needs. Option C: nothing, on the grounds that no real client does this.")
+/// @yah:verify("Reproduce per-origin with --resolve, never through round-robin DNS: curl --http1.1 vs default against https://cloud.mesh.yah.dev/ts2021 with Upgrade + Connection headers, sampling headscale's No-Upgrade count on us-south-001 either side. Expect delta 0 for --http1.1 and delta 1 per request for h2.")
+/// @yah:gotcha("MEASURED 2026-09-09 during the R870-B14 roll, and it cost real diagnosis time. build_tls_settings calls settings.enable_h2() unconditionally (tls.rs:240), so EVERY door including passway-mesh offers h2 ahead of http/1.1 in ALPN. HTTP/2 has no Upgrade mechanism at all - RFC 9113 8.2.2 forbids the Connection and Upgrade headers outright - so a client that negotiates h2 to cloud.mesh.yah.dev cannot carry a TS2021 upgrade offer no matter what passway does with hop-by-hop headers. Proven per-origin: the same POST with Upgrade: tailscale-control-protocol + Connection: upgrade returns 500 over h2 and 400 over --http1.1, and only the h2 form adds a `No Upgrade header in TS2021 request` line to headscale's stderr. THIS IS NOT AN R870-B14 REGRESSION and does not affect the fleet: real tailscaled speaks HTTP/1.1 for TS2021, which is why every node re-registered within seconds of the B14 roll. It is a latent seam on the door that grants meshes, and it makes an h2 client's failure indistinguishable from the three-day outage B14 just fixed.")
+/// @yah:handoff("DECIDED AND SHIPPED: option B, with option A's documentation folded in. Leader's call, recorded because the ticket asked 'is this a bug at all' first: it is not a broken client (real tailscaled speaks HTTP/1.1 for TS2021), it is an AMBIGUITY — an h2 client's failure is byte-for-byte the three-day outage R870-B14 just fixed, same `No Upgrade header in TS2021 request` line, same 500. A comment only helps whoever reads it; making the mesh door incapable of negotiating h2 removes the failure mode structurally. WHAT LANDED, four files, all uncommitted in the working tree at anchor e714a29f: (1) oss/passway/crates/passway/src/tls.rs — new `AlpnPolicy` enum (H2AndHttp11 = Default, Http11Only), `ALPN_ENV`/`parse_alpn_policy`, and `build_tls_settings(mode, alpn)` now takes the policy and calls `settings.set_alpn(alpn.alpn())` instead of the unconditional `enable_h2()`. Signature changed rather than a parallel constructor added, per the below-v1.0.0 rule; there is exactly ONE call site tree-wide (grepped) and it is fixed. (2) src/main.rs — env-table row + parse + pass-through. (3) app/yah/cli/resources/passway-mesh.env — `PASSWAY_ALPN=http/1.1` with the RFC-9113 reason and an explicit 'do NOT copy this to an apex or tenant door'. (4) app/yah/cli/tests/camp_systemd_unit_emit.rs — the template contract test now asserts it.")
+/// @yah:handoff("VERIFIED FIRST, as instructed: passway-mesh IS a dedicated instance fronting only the mesh control plane, on all three doors, so turning h2 off there is not a regression for any web client. Read live 2026-09-09, not inferred: /etc/passway-mesh.env on us-east-001 (debian@51.81.85.145), us-south-001 (root@45.32.194.254) and us-west-001 (debian@15.204.89.240) each declare exactly ONE upstream key, `PASSWAY_UPSTREAMS=cloud.mesh.yah.dev=<addr>` (east+west -> 45.32.194.254:443 remote, south -> 127.0.0.1:8080 co-located), on loopback :8444. Ordinary web traffic is on OTHER processes entirely — each node runs 6 passways (passway-demux, passway-http-router, passway-mesh, passway-noisetable, passway-scrabcake, and passway.service/passway-test.service). The demux routes file on south (/var/lib/passway/routes/demux.routes) sends only the exact SNI `cloud.mesh.yah.dev` to :8444; `*.yah.dev` goes to the apex on :8443, so even the door's second SAN `<node>.origin.yah.dev` never lands here.")
+/// @yah:handoff("AND THE ONE THING THAT COULD HAVE MADE THIS WRONG, checked rather than assumed: headscale's gRPC API needs HTTP/2, and killing h2 in front of it would break it. It is NOT behind this door — /var/lib/yah-cloud/headscale/config.yaml on us-south-001 has `listen_addr: 127.0.0.1:8080` (the door's only upstream) but `grpc_listen_addr: 127.0.0.1:50443` and `metrics_listen_addr: 127.0.0.1:9090`, neither of which the door or the demux ever reaches. Embedded DERP is `derp.server.enabled: false`, so TS2021 is the only Upgrade-based protocol behind this door at all. Nothing behind passway-mesh consumes h2.")
+/// @yah:verify("cargo test --manifest-path oss/passway/Cargo.toml -p passway --lib = 197 passed / 0 failed, 6 of them new in tls::tests. The opt-out is tested over the pure settings-construction path with no live door: default-when-unset (the assertion that makes this opt-OUT rather than a behaviour change for every existing door), empty/whitespace = default, `http/1.1` -> AlpnPolicy::Http11Only -> ALPN::H1, the explicit `h2,http/1.1` spelling incl. whitespace and case, and unrecognized values (`h2` alone, `http/1.0`, `http/1.1,h2`, `,`) rejected as a boot failure rather than silently falling back to the default. cargo build -p passway --bins clean. cargo clippy -p passway --lib --bins = 3 warnings, ALL pre-existing and in files this pass never touched (auth.rs result_unit_err, path.rs manual case-insensitive compare, proxy.rs manual_option_zip). cargo test -p yah --test main camp_systemd_unit_emit = 14 passed / 0 failed (1 new assertion inside the_mesh_front_door_is_enabled_loopback_only_and_owns_no_second_port).")
+/// @yah:verify("THE 258/0 BASELINE COULD NOT BE MATCHED AS A NUMBER, and the reason is a peer's file, not my change — stated plainly rather than reported as a pass. `cargo test -p passway` (all targets) FAILS TO BUILD the `main` integration target: oss/passway/crates/passway/tests/path_routes_file.rs, untracked and mid-flight from @Glimmerstone:griffin (R870-T18), does not compile — error[E0509] `cannot move out of type Door, which implements the Drop trait` at :259:61 and :294:61 (`door.0.wait_with_output()`, door.0 being a tokio::process::Child). I did not touch it: my diff is src/tls.rs, src/main.rs, and two files under app/yah/cli/, nothing under passway/tests/. So the 43+32 integration halves of the baseline are UNRUN by me; the 183->197 lib half is green and includes peers' 8 new lib tests plus my 6. Told @Glimmerstone:griffin directly via party.chat with the exact error. Re-run `cargo test --manifest-path oss/passway/Cargo.toml -p passway` once T18 lands to close the baseline out.")
+/// @yah:verify("THE LIVE A/B IN THIS TICKET'S OWN verify WAS DELIBERATELY NOT RE-RUN, and the health signal is untouched. The R870-B14 courier already measured it (500 over h2 / 400 over --http1.1, +1 No-Upgrade line per h2 request) and this change is UNROLLED, so re-running would have proven nothing new while dirtying the exact counter the operator is using as the mesh-health assertion. Instead I confirmed the premise with a probe that generates NO HTTP request at all: `openssl s_client -connect <door ip>:443 -servername cloud.mesh.yah.dev -alpn h2,http/1.1 </dev/null`, per-origin against all three door IPs. All three answer `ALPN protocol: h2` with subject=/CN=cloud.mesh.yah.dev — the premise, confirmed on every door rather than one. COUNTER LEFT WHERE I FOUND IT: /var/lib/yah/kamaji/native/headscale/stderr.log on us-south-001 read 5313 with last line 2026-09-09T08:02:27Z before my probes and 5313 with the same last line after. ZERO of those 5313 lines are mine. (Note for the next sampler: the count is in that kamaji log file, not in journalctl — headscale is a kamaji workload here, not a systemd unit, and `journalctl | grep -c` returns 0.) POST-ROLL, the same openssl probe is the check: `-alpn h2` alone should FAIL the handshake with no_application_protocol, and `-alpn h2,http/1.1` should answer `http/1.1`.")
+/// @yah:gotcha("UNROLLED, DELIBERATELY — this is source-only and NOTHING on the fleet has changed. Operator's call: the three doors were already rolled twice on 2026-09-09 (R870-T10's holding reader as hotship 0.8.36-h10, then R870-B14's Upgrade fix as passway sha da64b48e built from anchor 5f4c7b8b plus hardening.rs), the mesh had been healthy under an hour, and a third same-day roll of the door that grants meshes is not worth a low-severity latent seam. All three doors still answer `ALPN protocol: h2` for cloud.mesh.yah.dev as of this writing.")
+/// @yah:gotcha("WHAT ROLLING IT WOULD TAKE, and the trap in doing it half-way. It is TWO changes and the env one alone is a SILENT NO-OP: a passway that predates this commit does not read PASSWAY_ALPN at all, so setting `PASSWAY_ALPN=http/1.1` in /etc/passway-mesh.env on a door running today's binary changes nothing and looks done. Both halves, per door (east debian@51.81.85.145, south root@45.32.194.254, west debian@15.204.89.240): (1) build passway from this source and ship the binary; (2) add `PASSWAY_ALPN=http/1.1` to /etc/passway-mesh.env — the line and its rationale are already in the template at app/yah/cli/resources/passway-mesh.env, which is what the doors are rendered from; (3) activate. Verify per-origin with the zero-traffic probe in this ticket's verify list, NOT with an HTTP request. Rollback is deleting the env line and activating again — the new binary with PASSWAY_ALPN unset is byte-identical in behaviour to the old one, which is the whole point of making it opt-out.")
+/// @yah:gotcha("HOW THIS INTERACTS WITH THE STANDING R870-T3 GAP, which I was told not to pick up and did not: passway-mesh carries no T3 drop-in on ANY door (re-measured by the B14 courier, noted at tls.rs:203 — there is no /etc/systemd/system/passway-mesh.service.d/ anywhere), so activating step (3) above is a connection-DROPPING `systemctl restart passway-mesh`, not a `systemctl reload`. That is the interaction: with the T3 drop-in installed this roll would be a zero-drop reload of the door that grants meshes; without it, every future ALPN or cert change on that door costs a restart. It does not block this change — an ALPN change needs a new process either way — it just sets the price of landing it. Installing the drop-in is still its own restart plus a Type=notify conversion, and remains out of scope here.")
+/// @yah:gotcha("A DESIGN POINT WORTH NOT RE-LITIGATING: `parse_alpn_policy` rejects `h2` alone and rejects `http/1.1,h2`. The first is rejected because an h2-only door refuses every ordinary HTTP/1.1 client; the second because it would be a genuinely different offer (http/1.1 preferred) that pingora's ALPN enum cannot express — accepting it as a synonym for the default would be a lie in the config file. An unrecognized value is a boot panic rather than a fallback to the default, because a typo'd opt-out that quietly leaves h2 on reintroduces exactly the indistinguishable failure this ticket exists to remove.")
+/// @yah:verify("LEADER CLOSING THE UNRUN BASELINE (session:abde2cbb, 2026-09-09). This ticket honestly reported that it could not match the 258/0 passway baseline because oss/passway/crates/passway/tests/path_routes_file.rs (untracked, mid-flight from R870-T18) failed to build with error[E0509] cannot move out of type Door, and that the 43+32 integration halves were therefore UNRUN. That is now closed with evidence this ticket did not have: after T18 landed, I ran cargo test --manifest-path oss/passway/Cargo.toml -p passway myself and got 197 lib + 43 + 35 integration = 275 passed / 0 failed. So the integration targets do build, the halves this ticket left unrun are green, and the 197 lib figure it did report is confirmed inside a fully-building suite. Nothing here needed re-doing; the gap was a peer timing artifact, exactly as diagnosed.")
+/// @yah:verify("LEADER CONTENT VERIFICATION (session:abde2cbb): the opt-out landed as described — `pub enum AlpnPolicy` at oss/passway/crates/passway/src/tls.rs:262 and `pub fn parse_alpn_policy` at :292, i.e. a changed signature rather than a parallel constructor beside the old unconditional enable_h2(), which is what the below-v1.0.0 rule asked for. Combined with my earlier run of the full passway suite at 275 passed / 0 failed, this ticket is verified on both axes despite its own baseline having been blocked by a peer timing artifact at the time it ran.")
+pub fn build_tls_settings(mode: &TlsMode, alpn: AlpnPolicy) -> pingora::Result<TlsSettings> {
     let (cert_path, key_path) = match mode {
         TlsMode::Manual { cert_path, key_path } => (cert_path, key_path),
         TlsMode::Acme { cert_path, key_path } => (cert_path, key_path),
     };
     let mut settings = TlsSettings::intermediate(cert_path, key_path)?;
-    settings.enable_h2();
+    // `set_alpn(ALPN::H2H1)` is exactly what `enable_h2()` does (pingora-core
+    // 0.8.1 `listeners/tls/rustls/mod.rs`); going through `set_alpn` is what
+    // makes the H1-only case expressible at all.
+    settings.set_alpn(alpn.alpn());
     Ok(settings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An env getter where [`ALPN_ENV`] holds `value` and nothing else is set.
+    fn alpn_env(value: Option<&'static str>) -> impl Fn(&str) -> Option<String> {
+        move |k: &str| {
+            (k == ALPN_ENV)
+                .then_some(value)
+                .flatten()
+                .map(str::to_string)
+        }
+    }
+
+    #[test]
+    fn the_default_is_h2_with_http11_fallback() {
+        // Every existing door is unset, and must keep the exact pre-R870-T21
+        // offer. This is the assertion that makes the change opt-OUT.
+        assert_eq!(parse_alpn_policy(alpn_env(None)).unwrap(), AlpnPolicy::H2AndHttp11);
+        assert_eq!(AlpnPolicy::default(), AlpnPolicy::H2AndHttp11);
+        assert_eq!(AlpnPolicy::H2AndHttp11.alpn(), ALPN::H2H1);
+    }
+
+    #[test]
+    fn an_empty_value_is_the_default_not_an_error() {
+        // A systemd EnvironmentFile line left as `PASSWAY_ALPN=` is absence.
+        for raw in ["", "   ", "\t\n"] {
+            assert_eq!(
+                parse_alpn_policy(alpn_env(Some(raw))).unwrap(),
+                AlpnPolicy::H2AndHttp11,
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_door_can_opt_out_of_h2() {
+        // The whole point: the mesh door offers ONLY http/1.1, so a client
+        // there cannot negotiate a protocol TS2021 can never use.
+        let policy = parse_alpn_policy(alpn_env(Some("http/1.1"))).unwrap();
+        assert_eq!(policy, AlpnPolicy::Http11Only);
+        assert_eq!(policy.alpn(), ALPN::H1);
+    }
+
+    #[test]
+    fn the_default_can_also_be_spelled_out_explicitly() {
+        for raw in ["h2,http/1.1", " h2 , http/1.1 ", "H2,HTTP/1.1"] {
+            assert_eq!(
+                parse_alpn_policy(alpn_env(Some(raw))).unwrap(),
+                AlpnPolicy::H2AndHttp11,
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_value_is_a_boot_failure_not_a_silent_default() {
+        // A typo'd opt-out that quietly leaves h2 on would reintroduce the
+        // exact indistinguishable failure this ticket removes — and `h2`
+        // alone is rejected because it refuses every HTTP/1.1 client.
+        // `,` is in this list on purpose: it is a typo, not absence. Only a
+        // wholly blank value reads as "the operator did not set this".
+        for raw in ["http/1.0", "h2", "http/1.1,h2", "none", "true", ","] {
+            let err = parse_alpn_policy(alpn_env(Some(raw))).unwrap_err();
+            assert!(err.contains(ALPN_ENV) && err.contains(raw), "{raw:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn ordering_is_not_a_free_synonym() {
+        // `http/1.1,h2` would be a DIFFERENT offer (http/1.1 preferred), and
+        // pingora's ALPN enum cannot express it. Rejected rather than
+        // silently treated as the h2-preferring default.
+        assert!(parse_alpn_policy(alpn_env(Some("http/1.1,h2"))).is_err());
+    }
 }

@@ -148,6 +148,11 @@ fn discovery_sources(yubabas: &[SocketAddr]) -> Arc<YubabaUpstreams> {
         base_urls: yubabas.iter().map(|y| format!("http://{y}")).collect(),
         ident: "marketing".to_string(),
         timeout: Duration::from_secs(2),
+        // No persistence: these are single-process integration tests, so the
+        // in-memory hold is the behaviour under test. The R870-F4 cache has
+        // its own unit tests in `discovery.rs`.
+        cache_path: None,
+        cache_max_age: Duration::from_secs(300),
     }))
 }
 

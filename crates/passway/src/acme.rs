@@ -489,14 +489,43 @@ impl AcmeConfig {
 /// finalize) and hands back the PEM bytes in memory; this shell owns the
 /// cert-to-disk write, so the on-disk shape the TLS listener reads is
 /// unchanged from before the engine extraction.
+///
+/// R853-F4: whatever is already at `config.cert_path` is named to the CA as
+/// the certificate this order replaces (RFC 9773 / ARI). It is deliberately
+/// read here rather than threaded down from [`cert_needs_renewal`] — this is
+/// the one funnel every issuance passes through, so a third call site cannot
+/// silently start ordering without it. Nothing about issuance depends on it
+/// succeeding: no cert on disk (first boot), an unreadable one, a cert from a
+/// different CA than the configured directory — all yield `None` or a
+/// `replaces` the CA declines, and the engine falls back to a plain order.
+/// What it buys is that a *widened* `PASSWAY_ACME_DOMAIN` is still a renewal:
+/// ARI matches on one shared identifier, where the CA's own exact-set
+/// detection would not, and the New Certificates per Exact Set of Identifiers
+/// limit it drops us into (5 per 7 days) is one Let's Encrypt will not
+/// override.
 async fn issue_and_write(config: &AcmeConfig, tokens: &ChallengeTokens) -> Result<(), AcmeError> {
-    let issued = acme_engine::issue(&config.to_issue_config(), tokens).await?;
+    let replaces = std::fs::read_to_string(&config.cert_path)
+        .ok()
+        .and_then(|pem| acme_engine::ari_certificate_id(&pem));
+    let issued =
+        acme_engine::issue(&config.to_issue_config(), tokens, replaces.as_deref()).await?;
     write_cert_atomic(&config.cert_path, &config.key_path, &issued.cert_chain_pem, &issued.key_pem)?;
     log::info!(
-        "passway acme: issued a new cert for [{}] from {} (~{:?} validity) — written to {}",
+        "passway acme: issued a new cert for [{}] from {} (~{:?} validity, {}) — written to {}",
         config.domains.join(", "),
         config.directory.url(),
         config.cert_lifetime,
+        // Worth a word in the line an operator actually reads: an order that
+        // silently stopped being a declared renewal is one that starts
+        // spending rate-limit budget, and nothing else about it looks
+        // different.
+        if issued.renewed_via_ari {
+            "declared to the CA as an ARI renewal"
+        } else if replaces.is_some() {
+            "NOT accepted as an ARI renewal — see the warning above"
+        } else {
+            "no previous cert to renew from"
+        },
         config.cert_path
     );
     Ok(())

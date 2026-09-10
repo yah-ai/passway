@@ -30,15 +30,17 @@
 //! actually hands us) `Deref`s/`DerefMut`s to `http::request::Parts`, whose
 //! `headers` field is exactly this type.
 
-use http::header::{CONNECTION, CONTENT_LENGTH, TRANSFER_ENCODING};
+use http::header::{CONNECTION, CONTENT_LENGTH, TRANSFER_ENCODING, UPGRADE};
 use http::HeaderMap;
 
 /// RFC 7230 §6.1 hop-by-hop headers, plus the legacy `Keep-Alive` header
 /// (RFC 2616 §14.10 wording; still sent by real clients/proxies even though
 /// RFC 7230 folded it under `Connection`). These are connection-scoped
 /// between a client and *this* proxy — forwarding them to the upstream is
-/// meaningless at best and a framing hazard at worst (`Upgrade` in
-/// particular must never leak to an upstream that never agreed to it).
+/// meaningless at best and a framing hazard at worst.
+///
+/// `connection` and `upgrade` are on this list but are NOT stripped from a
+/// well-formed upgrade request — see [`is_upgrade_request`] and R870-B14.
 pub const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
@@ -67,6 +69,44 @@ pub const HOP_BY_HOP: &[&str] = &[
 /// keeps the "client can't nominate these" set explicit and complete.
 const NEVER_NOMINATE_STRIP: &[&str] = &["content-length", "transfer-encoding", "host", "te"];
 
+/// `true` when `headers` describe a well-formed protocol upgrade — an
+/// `Upgrade` header naming the target protocol *and* an `upgrade` token in
+/// `Connection`. RFC 7230 §6.7 requires both; either one alone is not an
+/// upgrade and gets the ordinary hop-by-hop treatment.
+///
+/// R870-B14 — WHY THIS EXISTS, and why blanket-stripping `Upgrade` was wrong.
+/// RFC 7230 §6.7 says an intermediary that intends to *forward* an upgrade
+/// must pass `Connection: upgrade` + `Upgrade:` through; stripping them makes
+/// it structurally impossible for any upstream behind passway to ever speak a
+/// second protocol, because the upstream never learns an upgrade was asked
+/// for. That took the whole fleet's mesh down for three days: R858-T1 moved
+/// `cloud.mesh.yah.dev` (headscale) behind a passway door, headscale's
+/// TS2021 noise transport IS an HTTP upgrade
+/// (`Upgrade: tailscale-control-protocol`), and every control-plane request
+/// in the fleet started failing with headscale logging "No Upgrade header in
+/// TS2021 request. If headscale is behind a reverse proxy, make sure it is
+/// configured to pass WebSockets through." Nodes already holding a netmap
+/// coasted on it; us-west-011 rebooted, had to re-register, and could not.
+///
+/// The original concern — "`Upgrade` must never leak to an upstream that
+/// never agreed to it" — is still honoured. An upstream that does not want to
+/// upgrade simply does not answer `101`, and the exchange stays ordinary
+/// HTTP. What it must not do is never see the offer at all.
+pub fn is_upgrade_request(headers: &HeaderMap) -> bool {
+    if !headers.contains_key(UPGRADE) {
+        return false;
+    }
+    headers.get_all(CONNECTION).iter().any(|v| {
+        v.to_str()
+            .map(|s| s.split(',').any(|tok| tok.trim().eq_ignore_ascii_case("upgrade")))
+            .unwrap_or(false)
+    })
+}
+
+/// Header names that survive on a well-formed upgrade request (they are the
+/// upgrade offer itself). Everything else in [`HOP_BY_HOP`] is still stripped.
+const UPGRADE_PRESERVED: &[&str] = &["connection", "upgrade"];
+
 /// Compute the (lowercased) set of header names to strip from a request
 /// before forwarding it upstream.
 ///
@@ -84,7 +124,15 @@ const NEVER_NOMINATE_STRIP: &[&str] = &["content-length", "transfer-encoding", "
 /// the underlying [`HeaderMap`] would desync those two and trip pingora's
 /// HTTP/1 serializer.
 pub fn headers_to_strip(headers: &HeaderMap) -> Vec<String> {
-    let mut names: Vec<String> = HOP_BY_HOP.iter().map(|s| s.to_string()).collect();
+    // R870-B14: on a well-formed upgrade request the offer itself must reach
+    // the upstream, or no upstream behind passway can ever speak a second
+    // protocol. See `is_upgrade_request` for the outage this caused.
+    let upgrading = is_upgrade_request(headers);
+    let mut names: Vec<String> = HOP_BY_HOP
+        .iter()
+        .filter(|n| !(upgrading && UPGRADE_PRESERVED.contains(*n)))
+        .map(|s| s.to_string())
+        .collect();
     for v in headers.get_all(CONNECTION).iter() {
         if let Ok(s) = v.to_str() {
             for tok in s.split(',') {
@@ -96,6 +144,12 @@ pub fn headers_to_strip(headers: &HeaderMap) -> Vec<String> {
                 // for stripping (it's stripped only if it's an actual
                 // hop-by-hop header on the fixed list above).
                 if NEVER_NOMINATE_STRIP.contains(&tok.as_str()) {
+                    continue;
+                }
+                // `Connection: Upgrade` nominates the token "upgrade"; on an
+                // upgrade request that nomination must not undo the exemption
+                // above.
+                if upgrading && UPGRADE_PRESERVED.contains(&tok.as_str()) {
                     continue;
                 }
                 if !names.contains(&tok) {
@@ -183,6 +237,75 @@ mod tests {
         assert!(!h.contains_key("x-secret-internal"));
         assert!(!h.contains_key("x-other"));
         assert_eq!(h.get("x-keep").unwrap(), "kept");
+    }
+
+    // ---- R870-B14: upgrade offers must reach the upstream ----
+
+    #[test]
+    fn well_formed_upgrade_offer_survives_to_upstream() {
+        // The headscale TS2021 shape that R858-T1 broke: without both headers
+        // reaching the upstream, headscale logs "No Upgrade header in TS2021
+        // request" and the whole tailnet loses its control plane.
+        let mut h = headers(&[
+            ("connection", "Upgrade"),
+            ("upgrade", "tailscale-control-protocol"),
+            ("keep-alive", "timeout=5"),
+            ("x-request-id", "abc123"),
+        ]);
+        assert!(is_upgrade_request(&h));
+        strip_hop_by_hop(&mut h);
+        assert_eq!(h.get("connection").unwrap(), "Upgrade");
+        assert_eq!(h.get("upgrade").unwrap(), "tailscale-control-protocol");
+        // Everything else hop-by-hop still goes.
+        assert!(!h.contains_key("keep-alive"));
+        assert_eq!(h.get("x-request-id").unwrap(), "abc123");
+    }
+
+    #[test]
+    fn upgrade_offer_does_not_smuggle_other_hop_by_hop_headers() {
+        // The exemption is exactly {connection, upgrade}; an upgrade request
+        // must not become a way to push transfer-encoding/te upstream.
+        let mut h = headers(&[
+            ("connection", "Upgrade, TE, X-Sneaky"),
+            ("upgrade", "websocket"),
+            ("te", "trailers"),
+            ("transfer-encoding", "chunked"),
+            ("x-sneaky", "strip-me"),
+        ]);
+        strip_hop_by_hop(&mut h);
+        assert_eq!(h.get("connection").unwrap(), "Upgrade, TE, X-Sneaky");
+        assert_eq!(h.get("upgrade").unwrap(), "websocket");
+        assert!(!h.contains_key("te"));
+        assert!(!h.contains_key("transfer-encoding"));
+        assert!(!h.contains_key("x-sneaky"), "nominated headers still strip");
+    }
+
+    #[test]
+    fn upgrade_header_without_connection_token_is_not_an_upgrade() {
+        // Half an offer is not an offer (RFC 7230 §6.7 requires both), so it
+        // gets the ordinary hop-by-hop treatment and never reaches upstream.
+        let mut h = headers(&[("connection", "keep-alive"), ("upgrade", "websocket")]);
+        assert!(!is_upgrade_request(&h));
+        strip_hop_by_hop(&mut h);
+        assert!(!h.contains_key("upgrade"));
+        assert!(!h.contains_key("connection"));
+    }
+
+    #[test]
+    fn connection_upgrade_token_without_upgrade_header_is_not_an_upgrade() {
+        let mut h = headers(&[("connection", "Upgrade")]);
+        assert!(!is_upgrade_request(&h));
+        strip_hop_by_hop(&mut h);
+        assert!(!h.contains_key("connection"));
+    }
+
+    #[test]
+    fn upgrade_detection_is_case_insensitive_and_tolerates_token_lists() {
+        let h = headers(&[
+            ("connection", "keep-alive, UPGRADE"),
+            ("upgrade", "h2c"),
+        ]);
+        assert!(is_upgrade_request(&h));
     }
 
     #[test]

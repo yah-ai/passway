@@ -20,6 +20,12 @@ mod host_routing;
 #[cfg(all(target_os = "linux", feature = "socket-activation"))]
 mod jit_cold_start;
 mod path_confusion;
+// R870-T18: the same behaviours as `path_routing`, but through a FORKED
+// passway binary configured by `PASSWAY_PATH_ROUTES_FILE` — the gate F15 could
+// not run, because until T18 nothing could configure a real process with a
+// `PathRouter`.
+mod path_routes_file;
+mod path_routing;
 mod round_robin;
 #[cfg(all(target_os = "linux", feature = "socket-activation"))]
 mod socket_activation;

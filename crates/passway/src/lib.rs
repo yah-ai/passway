@@ -30,6 +30,11 @@
 //!   upstream-set map that lets one node front several services. Sits above
 //!   the [`upstream`] seam (N sources, N load balancers) rather than
 //!   replacing it.
+//! - [`path_route`] — R870-F15: [`path_route::PathRouter`], the same-shaped
+//!   map keyed by request-path mount instead of host, for a passway
+//!   deployed as one service's own inner door (or the outer door's reserved
+//!   surfaces). [`proxy::PassProxy`] runs either this or [`routing::HostRouter`]
+//!   for a given process — same mechanism, the tier is which one is wired up.
 //! - [`host`] — request-authority extraction and normalization for that map
 //!   (`Host` / `:authority`, fail-closed on an ambiguous authority).
 //! - [`auth`] — `cheers-verify` wiring ([`auth::CheersAuth`]) and the
@@ -46,6 +51,12 @@
 //!   the same form the upstream resolves.
 //! - [`health`] — the `/health` readiness computation, independent of any
 //!   pingora type.
+//! - [`holding`] — R870-F5: the body a fail-ready 503 carries. An
+//!   enrolled-but-unbacked tenant gets a styled holding page instead of the
+//!   browser's naked error chrome; the 503 *status* is untouched, and a
+//!   machine caller still gets the same JSON. R870-F8 adds the per-authority
+//!   override a door reads from `PASSWAY_HOLDING_DIR`, for domains whose brand
+//!   the operator owns; every other authority keeps the built-in page.
 //! - [`sd_notify`] — R870-T3: the `MAINPID=`/`READY=1` datagram that lets a
 //!   `Type=notify` systemd unit follow pingora's graceful upgrade to the
 //!   replacement process, so a cert rotation on a systemd door swaps the
@@ -91,9 +102,12 @@ pub mod auth;
 pub mod discovery;
 pub mod hardening;
 pub mod health;
+pub mod holding;
 pub mod host;
 pub mod idle;
 pub mod path;
+pub mod path_route;
+pub mod path_routes_file;
 pub mod proxy;
 pub mod redirect;
 pub mod routing;
@@ -107,6 +121,8 @@ pub use auth::{CheersAuth, RouteAuthPolicy};
 pub use discovery::{YubabaDiscoveryConfig, YubabaUpstreams};
 pub use health::{HostReadiness, ReadinessBody};
 pub use host::{request_host, HostOutcome};
+pub use path_route::{build_path_router, MountSource, PathRoute, PathRouter, PathRouterError};
+pub use path_routes_file::{PathRouteEntry, PathRoutesError, PathRoutesFile};
 pub use proxy::PassProxy;
 pub use routing::{build_host_router, HostKey, HostRouter};
 pub use tls::TlsMode;

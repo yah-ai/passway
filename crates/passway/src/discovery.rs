@@ -65,6 +65,37 @@
 //! worst case is routing to a set that is stale but still individually
 //! verified, never to a black hole.
 //!
+//! ## …and a RESTART is not an empty upstream set either (R870-F4)
+//!
+//! The rule above was scoped to the process. `last_good` lived only in memory,
+//! so `systemctl restart passway` threw away every held set and each source
+//! came back as a first-ever boot — contributing nothing until its first
+//! successful poll, one whole `update_frequency` away.
+//!
+//! That is not a hypothetical. Rolling all three prod voters on 2026-09-08
+//! restarted passway beside yubaba on each box; every door's first poll raced
+//! yubaba's own restart, lost, and logged *"no previous set exists for this
+//! node (cold start)"* — then fail-ready 503'd for ~30s while the backends it
+//! was meant to reach were up the whole time. Ordering the units only narrows
+//! that window, because `yubaba.service` is `Type=simple` and counts as started
+//! before it binds.
+//!
+//! So the held sets are persisted ([`YubabaDiscoveryConfig::cache_path`]) and
+//! seeded at construction, which makes a restart behave like the failed fetch
+//! it actually is. Three properties keep that honest:
+//!
+//! - **Only a tick that learned something rewrites the file.** An all-failed
+//!   tick must not restamp `written_at_unix_ms` onto sets nobody re-confirmed,
+//!   or a door blind for an hour would still look seconds-old.
+//! - **An authoritative empty is persisted as an empty set**, never as
+//!   "unknown" — the same distinction the in-memory rule draws, so a restart
+//!   cannot revive backends the cluster deliberately retired.
+//! - **The seed expires** ([`YubabaDiscoveryConfig::cache_max_age`]). Backend
+//!   ports here are allocated by kamaji rather than declared, so a
+//!   long-stale address may since have been reassigned to a different
+//!   workload. Past the bound the door starts cold: 503 is the right answer,
+//!   routing to the wrong backend is not.
+//!
 //! ## Poll N yubabas, and hold PER SOURCE (R844-F23)
 //!
 //! One source used to poll one yubaba, which meant a workload placed on more
@@ -128,12 +159,14 @@
 //! @yah:verify("PURITY CANARY HELD: `cargo test -p xtask --test main mirror_ingress` = 11 passed / 0 failed, unchanged, so `plan_ingress` still plans the real .yah/services tree with no network and no credentials. Expected — this ticket changed the RENDERING downstream of the plan, not the plan — but it is the assertion that proves it, so it was run rather than reasoned about. `.yah/services/` was not touched (R844-T10's comments-only diff is intact), and neither were `ReadyRecordWait` / `apply_mirror_phases` (R844-B24 / R844-B19). Nothing in oss/passway/crates/sni-demux/ was touched; that is @Ashguard:eclipse's R858 territory and `discovery.rs` / `main.rs` were clean when I took them.")
 //! @yah:handoff("NOT COMMITTED — no git write was requested and this is a shared tree. Files changed: oss/passway/crates/passway/src/discovery.rs, oss/passway/crates/passway/src/main.rs, oss/passway/crates/passway/tests/yubaba_discovery.rs, app/yah/cli/src/cloud.rs. Note that `git diff --stat` on cloud.rs shows ~694 changed lines; only ~200 of those are this ticket's (the `passway_discovery_env` rewrite plus the new `passway_poll_n_tests` module), the rest being peers' uncommitted R844-B24 / R844-B19 work in the same file. Any commit here must be pathspec-scoped.")
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::upstream::UpstreamSource;
 
@@ -202,6 +235,27 @@ pub struct YubabaDiscoveryConfig {
     /// nodes at the 5s/30s defaults (`PASSWAY_YUBABA_TIMEOUT_SECS`,
     /// `PASSWAY_UPDATE_INTERVAL_SECS`).
     pub timeout: Duration,
+    /// Where the last-known-good sets are persisted so they survive a process
+    /// restart (`PASSWAY_DISCOVERY_CACHE`). `None` disables persistence and
+    /// restores the pre-R870-F4 behaviour exactly: a restart starts cold.
+    ///
+    /// Without this, the hold-on-failure rule below is scoped to the process
+    /// lifetime, so `systemctl restart passway` drops every held set and the
+    /// door fail-ready 503s until its first poll lands — measured at ~30s on
+    /// us-east-001 2026-09-08, because the restart races yubaba's own restart
+    /// and the retry is one whole `update_frequency` away.
+    pub cache_path: Option<PathBuf>,
+    /// How old a persisted set may be and still be seeded on start.
+    ///
+    /// This bound is the whole reason the cache is not simply "the last set,
+    /// forever". Backend ports here are **allocated by kamaji, not declared**,
+    /// so an address that was correct long enough ago may now belong to a
+    /// different workload — reviving one would route traffic to the wrong
+    /// place, which is strictly worse than the 503 this feature exists to
+    /// remove. Bridging a restart needs seconds; anything beyond a generous
+    /// reboot window is not a restart, it is an outage whose backend set
+    /// should be re-learned rather than assumed.
+    pub cache_max_age: Duration,
 }
 
 impl YubabaDiscoveryConfig {
@@ -218,6 +272,151 @@ impl YubabaDiscoveryConfig {
             .iter()
             .map(|base| format!("{}{DISCOVERY_PATH}?ready=true", base.trim_end_matches('/')))
             .collect()
+    }
+}
+
+/// On-disk form of every source's last-known-good set (R870-F4).
+///
+/// Keyed by the full poll URL rather than by index, so adding, removing or
+/// reordering `base_urls` cannot silently hand one node's addresses to
+/// another — an entry whose URL is no longer configured is simply ignored, and
+/// a newly-configured URL starts cold, which is the honest answer for a node
+/// this door has never successfully polled.
+#[derive(Debug, Serialize, Deserialize)]
+struct DiscoveryCacheWire {
+    version: u32,
+    /// When this file was written, for the [`YubabaDiscoveryConfig::cache_max_age`]
+    /// check. Wall-clock rather than monotonic because it has to survive a
+    /// reboot, which is exactly the case it is written for.
+    written_at_unix_ms: u64,
+    /// Poll URL → the addresses that URL last authoritatively reported.
+    ///
+    /// An empty vector is a real, meaningful value: "this node answered, and it
+    /// has none". Seeding that is what stops a restart from reviving backends
+    /// the cluster had already retired.
+    sources: BTreeMap<String, Vec<String>>,
+}
+
+/// Schema version of [`DiscoveryCacheWire`]. A file announcing anything else is
+/// ignored (cold start), never guessed at.
+const CACHE_VERSION: u32 = 1;
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Read the persisted sets, dropping the whole file if it is unreadable,
+/// malformed, of an unknown version, or older than `max_age`.
+///
+/// Every failure here is a warning and a cold start, never a boot failure: the
+/// cache is an optimisation over the correct-but-slow path, and a door that
+/// refuses to start because a cache file is corrupt has turned a 30s
+/// degradation into a total outage.
+fn load_cache(path: &Path, max_age: Duration) -> BTreeMap<String, Vec<SocketAddr>> {
+    let empty = BTreeMap::new();
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            log::info!(
+                "{}: no discovery cache yet — this door starts cold and warms on its first poll",
+                path.display()
+            );
+            return empty;
+        }
+        Err(e) => {
+            log::warn!("{}: discovery cache unreadable ({e}) — starting cold", path.display());
+            return empty;
+        }
+    };
+    let wire: DiscoveryCacheWire = match serde_json::from_str(&raw) {
+        Ok(wire) => wire,
+        Err(e) => {
+            log::warn!("{}: discovery cache unparsable ({e}) — starting cold", path.display());
+            return empty;
+        }
+    };
+    if wire.version != CACHE_VERSION {
+        log::warn!(
+            "{}: discovery cache is version {}, this build understands {CACHE_VERSION} — \
+             starting cold",
+            path.display(),
+            wire.version
+        );
+        return empty;
+    }
+    let age = Duration::from_millis(now_unix_ms().saturating_sub(wire.written_at_unix_ms));
+    if age > max_age {
+        log::warn!(
+            "{}: discovery cache is {}s old (max {}s) — starting cold rather than reviving \
+             addresses whose kamaji-allocated ports may since have been reassigned",
+            path.display(),
+            age.as_secs(),
+            max_age.as_secs()
+        );
+        return empty;
+    }
+    let mut seeded = BTreeMap::new();
+    for (url, addrs) in wire.sources {
+        // A single unparsable address does not poison its node's set, for the
+        // same reason `addrs_from_body` skips rather than fails.
+        let parsed: Vec<SocketAddr> = addrs.iter().filter_map(|a| a.parse().ok()).collect();
+        seeded.insert(url, parsed);
+    }
+    log::info!(
+        "{}: seeded {} source(s) from the discovery cache ({}s old) — a restart holds what the \
+         previous process last knew instead of fail-ready 503ing until the first poll",
+        path.display(),
+        seeded.len(),
+        age.as_secs()
+    );
+    seeded
+}
+
+/// Write every source's held set, atomically (temp file + rename) so a crash
+/// mid-write leaves the previous cache rather than a truncated one.
+fn save_cache(path: &Path, sources: &[PolledSource]) {
+    let mut map = BTreeMap::new();
+    for source in sources {
+        // Only sources that have actually answered are persisted. A source
+        // holding `None` has nothing to say, and writing it as `[]` would be a
+        // lie — "answered with none" and "never seen" must stay distinct on
+        // disk for the same reason they do in memory.
+        if let Some(addrs) = source.last_good.lock().expect("last_good mutex").as_ref() {
+            map.insert(
+                source.url.clone(),
+                addrs.iter().map(|a| a.to_string()).collect(),
+            );
+        }
+    }
+    let wire = DiscoveryCacheWire {
+        version: CACHE_VERSION,
+        written_at_unix_ms: now_unix_ms(),
+        sources: map,
+    };
+    let body = match serde_json::to_string_pretty(&wire) {
+        Ok(body) => body,
+        Err(e) => {
+            log::warn!("discovery cache not serializable ({e}) — not persisted this tick");
+            return;
+        }
+    };
+    let tmp = path.with_extension("json.tmp");
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log::warn!("{}: cannot create discovery cache dir ({e})", parent.display());
+            return;
+        }
+    }
+    if let Err(e) = std::fs::write(&tmp, &body) {
+        log::warn!("{}: discovery cache write failed ({e})", tmp.display());
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        log::warn!("{}: discovery cache rename failed ({e})", path.display());
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -239,14 +438,20 @@ struct PolledSource {
     /// drain its share of the backend set. `None` until the first successful
     /// fetch: a cold start against an unreachable yubaba has no good set to
     /// fall back to and correctly contributes none.
+    ///
+    /// May also be *seeded* from the on-disk cache at construction (R870-F4),
+    /// which makes a process restart behave like the already-correct
+    /// failed-fetch hold instead of like a first-ever boot.
     last_good: Mutex<Option<Vec<SocketAddr>>>,
 }
 
 impl PolledSource {
-    fn new(url: String) -> Self {
+    /// `seed` is this URL's entry from the persisted cache, already age-checked
+    /// by [`load_cache`]. `None` is an ordinary cold start.
+    fn new(url: String, seed: Option<Vec<SocketAddr>>) -> Self {
         Self {
             url,
-            last_good: Mutex::new(None),
+            last_good: Mutex::new(seed),
         }
     }
 
@@ -310,6 +515,9 @@ pub struct YubabaUpstreams {
     /// [`YubabaDiscoveryConfig::ident`]. The same on every source: this is one
     /// hostname's set, gathered from every node that hosts it.
     ident: String,
+    /// Where [`Self::sources`]' held sets are persisted after each tick that
+    /// learned something. `None` disables persistence entirely.
+    cache_path: Option<PathBuf>,
 }
 
 impl YubabaUpstreams {
@@ -320,10 +528,25 @@ impl YubabaUpstreams {
             // Only fails if the TLS backend can't initialize; the same
             // `ring` provider the ACME path already installed.
             .expect("failed to build the yubaba discovery HTTP client");
+        // Seeded before the first poll, so the very first `addrs()` — which
+        // pingora calls during startup, often while yubaba is still binding —
+        // already has the previous process's answer to fall back on.
+        let mut seeds = match config.cache_path.as_deref() {
+            Some(path) => load_cache(path, config.cache_max_age),
+            None => BTreeMap::new(),
+        };
         Self {
             client,
-            sources: config.urls().into_iter().map(PolledSource::new).collect(),
+            sources: config
+                .urls()
+                .into_iter()
+                .map(|url| {
+                    let seed = seeds.remove(&url);
+                    PolledSource::new(url, seed)
+                })
+                .collect(),
             ident: config.ident.clone(),
+            cache_path: config.cache_path.clone(),
         }
     }
 
@@ -416,9 +639,22 @@ impl UpstreamSource for YubabaUpstreams {
         // costs (`sources.len() * timeout` per tick) is documented at
         // `YubabaDiscoveryConfig::timeout`.
         let mut union = Vec::new();
+        let mut learned = false;
         for source in &self.sources {
             let fetched = self.fetch(&source.url).await;
+            learned |= fetched.is_ok();
             union.extend(source.resolve(fetched));
+        }
+        // Persist only on a tick where at least one node actually answered.
+        // Rewriting after an all-failed tick would stamp a fresh
+        // `written_at_unix_ms` onto sets nobody re-confirmed, so a door that
+        // had been unable to see any yubaba for an hour would still look
+        // seconds-old to `load_cache` and its age bound would never fire —
+        // which is precisely the stale-port revival that bound exists to stop.
+        if learned {
+            if let Some(path) = self.cache_path.as_deref() {
+                save_cache(path, &self.sources);
+            }
         }
         if union.is_empty() {
             log::info!(
@@ -445,11 +681,161 @@ mod tests {
             base_urls: bases.iter().map(|b| b.to_string()).collect(),
             ident: "api".to_string(),
             timeout: Duration::from_millis(500),
+            // Persistence off by default in tests, so every pre-R870-F4
+            // assertion below still exercises the in-memory-only behaviour it
+            // was written for. The cache has its own tests.
+            cache_path: None,
+            cache_max_age: Duration::from_secs(300),
         }
     }
 
     fn body(json: &str) -> ServiceRecordsWire {
         serde_json::from_str(json).expect("test fixture parses")
+    }
+
+    /// A unique scratch path per test — this crate has no tempfile dep and the
+    /// dependency-justification rule in its Cargo.toml means one is not worth
+    /// adding for a handful of cache tests.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "passway-discovery-cache-test-{}-{}",
+            std::process::id(),
+            name
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir.join("discovery-_catchall.json")
+    }
+
+    fn write_cache(path: &Path, age: Duration, sources: &[(&str, &[&str])]) {
+        let wire = DiscoveryCacheWire {
+            version: CACHE_VERSION,
+            written_at_unix_ms: now_unix_ms().saturating_sub(age.as_millis() as u64),
+            sources: sources
+                .iter()
+                .map(|(url, addrs)| {
+                    (
+                        url.to_string(),
+                        addrs.iter().map(|a| a.to_string()).collect(),
+                    )
+                })
+                .collect(),
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("cache dir");
+        }
+        std::fs::write(path, serde_json::to_string(&wire).expect("serialize")).expect("write");
+    }
+
+    const URL: &str = "http://100.64.0.3:7443/service-records?ready=true";
+
+    #[test]
+    fn a_fresh_cache_seeds_the_held_set_so_a_restart_is_not_a_cold_start() {
+        // The whole point: this is the state a process restart lands in, and
+        // before R870-F4 it contributed nothing and 503d for a full poll
+        // interval.
+        let path = scratch("fresh");
+        write_cache(&path, Duration::from_secs(5), &[(URL, &["100.64.0.3:34759"])]);
+
+        let seeded = load_cache(&path, Duration::from_secs(300));
+        let source = PolledSource::new(URL.to_string(), seeded.get(URL).cloned());
+
+        assert_eq!(
+            source.resolve(Err("yubaba still binding".into())),
+            vec![addr("100.64.0.3:34759")],
+            "a seeded source holds the previous process's set through a failed first poll"
+        );
+    }
+
+    #[test]
+    fn a_cache_older_than_the_bound_is_refused_rather_than_reviving_stale_ports() {
+        // Backend ports are allocated by kamaji, so a long-stale address may
+        // now belong to a different workload. 503 is the correct answer there;
+        // routing to the wrong backend is not.
+        let path = scratch("stale");
+        write_cache(&path, Duration::from_secs(3600), &[(URL, &["100.64.0.3:34759"])]);
+
+        let seeded = load_cache(&path, Duration::from_secs(300));
+        assert!(seeded.is_empty(), "an over-age cache seeds nothing");
+
+        let source = PolledSource::new(URL.to_string(), seeded.get(URL).cloned());
+        assert!(
+            source.resolve(Err("unreachable".into())).is_empty(),
+            "and the source is then an ordinary cold start"
+        );
+    }
+
+    #[test]
+    fn an_authoritative_empty_survives_the_restart_as_an_empty_set_not_as_unknown() {
+        // "answered with none" and "never seen" must stay distinct across a
+        // restart, exactly as they are in memory — otherwise a door would
+        // resurrect backends the cluster had deliberately retired.
+        let path = scratch("empty");
+        write_cache(&path, Duration::from_secs(5), &[(URL, &[])]);
+
+        let seeded = load_cache(&path, Duration::from_secs(300));
+        assert_eq!(seeded.get(URL), Some(&vec![]), "the empty answer is seeded");
+    }
+
+    #[test]
+    fn a_source_that_never_answered_is_not_persisted_as_an_empty_set() {
+        let path = scratch("unanswered");
+        let sources = vec![PolledSource::new(URL.to_string(), None)];
+        save_cache(&path, &sources);
+
+        let raw = std::fs::read_to_string(&path).expect("cache written");
+        let wire: DiscoveryCacheWire = serde_json::from_str(&raw).expect("parses");
+        assert!(
+            wire.sources.is_empty(),
+            "a never-answered source writes no entry — `[]` would claim yubaba said 'none'"
+        );
+    }
+
+    #[test]
+    fn a_round_trip_through_disk_preserves_the_addresses() {
+        let path = scratch("roundtrip");
+        let sources = vec![PolledSource::new(URL.to_string(), None)];
+        sources[0].resolve(Ok(vec![addr("100.64.0.3:34759"), addr("100.64.0.3:40995")]));
+        save_cache(&path, &sources);
+
+        let seeded = load_cache(&path, Duration::from_secs(300));
+        assert_eq!(
+            seeded.get(URL),
+            Some(&vec![addr("100.64.0.3:34759"), addr("100.64.0.3:40995")])
+        );
+    }
+
+    #[test]
+    fn a_corrupt_or_unknown_version_cache_is_a_cold_start_not_a_boot_failure() {
+        let path = scratch("corrupt");
+        std::fs::write(&path, "{ this is not json").expect("write");
+        assert!(load_cache(&path, Duration::from_secs(300)).is_empty());
+
+        std::fs::write(&path, r#"{"version":99,"written_at_unix_ms":0,"sources":{}}"#)
+            .expect("write");
+        assert!(load_cache(&path, Duration::from_secs(300)).is_empty());
+
+        let missing = path.with_file_name("does-not-exist.json");
+        assert!(load_cache(&missing, Duration::from_secs(300)).is_empty());
+    }
+
+    #[test]
+    fn a_cache_entry_for_a_url_no_longer_configured_is_ignored() {
+        // Reconfiguring `base_urls` must never hand one node's addresses to
+        // another — the cache is keyed by URL precisely so this is structural.
+        let path = scratch("reconfigured");
+        write_cache(
+            &path,
+            Duration::from_secs(5),
+            &[("http://100.64.0.9:7443/service-records?ready=true", &["100.64.0.9:1234"])],
+        );
+
+        let seeded = load_cache(&path, Duration::from_secs(300));
+        let source = PolledSource::new(URL.to_string(), seeded.get(URL).cloned());
+        assert!(
+            source.resolve(Err("unreachable".into())).is_empty(),
+            "a newly-configured URL starts cold rather than adopting a stranger's set"
+        );
     }
 
     fn addr(s: &str) -> SocketAddr {

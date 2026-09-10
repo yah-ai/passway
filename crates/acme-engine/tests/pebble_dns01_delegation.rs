@@ -658,6 +658,8 @@ async fn pebble_validates_the_delegated_record_name_we_publish_at() {
             Some(DELEGATE_ZONE),
         ),
         &tokens,
+        // First issuance for this identifier: nothing to declare as replaced.
+        None,
     )
     .await
     .unwrap_or_else(|e| panic!("delegated issuance for {delegated_domain} failed: {e}"));
@@ -697,6 +699,7 @@ async fn pebble_validates_the_delegated_record_name_we_publish_at() {
     let issued = acme_engine::issue(
         &issue_config(&stack, &shim, &account_dir, &token_file, plain_domain, None),
         &tokens,
+        None,
     )
     .await
     .unwrap_or_else(|e| panic!("undelegated issuance for {plain_domain} failed: {e}"));
@@ -714,5 +717,45 @@ async fn pebble_validates_the_delegated_record_name_we_publish_at() {
     assert_eq!(
         plain_expected, "_acme-challenge.plain.example.test",
         "the undelegated contract is the RFC-8555 name in the identifier's own zone"
+    );
+
+    // -- case 3: the ARI renewal (R853-F4) ---------------------------------
+    //
+    // Re-order `plain_domain`, this time naming the cert just issued as the
+    // one being replaced. This is the only place the ARI *encoding* is
+    // checked against a real ACME server: `ari_certificate_id` builds the
+    // identifier out of the leaf's AKI and DER serial, and a unit test can
+    // only assert its shape — whether the CA agrees that this names the
+    // certificate it issued is a question only the CA can answer.
+    //
+    // The assertion has to be `renewed_via_ari`, not "issuance succeeded":
+    // `issue` deliberately re-orders WITHOUT `replaces` when the CA declines
+    // it, so a wrongly-encoded identifier would still hand back a perfectly
+    // good certificate and this test would pass while the rate-limit
+    // exemption it exists to secure was never obtained.
+    let replaces = acme_engine::ari_certificate_id(&issued.cert_chain_pem)
+        .expect("a Pebble-issued leaf carries an Authority Key Identifier");
+    let renewed = acme_engine::issue(
+        &issue_config(&stack, &shim, &account_dir, &token_file, plain_domain, None),
+        &tokens,
+        Some(&replaces),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("ARI renewal for {plain_domain} failed: {e}"));
+
+    assert!(
+        renewed.renewed_via_ari,
+        "Pebble rejected the `replaces` identifier {replaces:?} — the order fell back to a \
+         plain one, so the certificate below proves nothing about ARI"
+    );
+    assert!(
+        leaf_dns_names(&renewed.cert_chain_pem).iter().any(|n| n == plain_domain),
+        "the renewal's leaf must still carry the identifier; SANs were {:?}",
+        leaf_dns_names(&renewed.cert_chain_pem)
+    );
+    assert_ne!(
+        acme_engine::ari_certificate_id(&renewed.cert_chain_pem).as_deref(),
+        Some(replaces.as_str()),
+        "the renewal must be a NEW certificate, not the one it replaced"
     );
 }

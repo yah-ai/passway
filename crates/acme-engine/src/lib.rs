@@ -44,6 +44,36 @@
 //!   Cloudflare API. Required for wildcards; also the only challenge a
 //!   standby node (not holding the public identity) can renew with, since
 //!   validation never touches the node.
+//! ## Renewal identification (ARI) and why it is the rate-limit story
+//!
+//! A CA only exempts an order from its rate limits if it can tell the order is
+//! a *renewal*. Let's Encrypt recognizes two forms, and they are not equally
+//! good (read live from <https://letsencrypt.org/docs/rate-limits/>,
+//! 2026-09-08):
+//!
+//! - **Exact-identifier-set detection** — an order whose identifiers exactly
+//!   match an earlier certificate's. Free, requires no client support, and it
+//!   is what this engine relied on before R853-F4. It exempts only the New
+//!   Orders per Account and New Certificates per Registered Domain limits, and
+//!   it evaporates the moment a SAN list is widened, because a widened set is
+//!   not the same set.
+//! - **ARI ([RFC 9773](https://www.rfc-editor.org/rfc/rfc9773.html))** — the
+//!   order carries a `replaces` field naming the certificate it supersedes
+//!   ([`ari_certificate_id`], passed to [`issue`]). Exempt from *all* rate
+//!   limits, and the match rule is "at least one identifier in common", not
+//!   the whole set — so a widening is still a renewal.
+//!
+//! That difference is the whole reason this engine implements ARI. The limit
+//! it buys past is New Certificates per Exact Set of Identifiers (5 per 7
+//! days), which the same page says is not overridable at any price — so for a
+//! cert whose SAN list changes (passway's `PASSWAY_ACME_DOMAIN`, yubaba's
+//! fleet wildcard + `YUBABA_ACME_EXTRA_DOMAINS`) ARI, or a second CA, are the
+//! only two ways through. ARI is much the cheaper of the two: no External
+//! Account Binding, no second issuer axis in the cert store.
+//!
+//! It is *strictly* additive. The caller supplies `replaces` only if it kept
+//! one, the engine drops it if the directory or the CA declines, and either
+//! path lands on the pre-ARI behaviour rather than on a failed issuance.
 //!
 //! @yah:ticket(R853-T3, "Settle the Let's Encrypt order budget for the 10k fill: file the rate-limit adjustment request")
 //! @yah:at(2026-09-05T19:27:09Z)
@@ -71,18 +101,24 @@
 //! @yah:handoff("IF YOU DO REVIVE IT, the recipe rather than the artifact: form is https://isrg.formstack.com/forms/rate_limit_adjustment_request (confirmed by following the 'request an override' link on https://letsencrypt.org/docs/rate-limits/ rather than from memory). Its fields are JS-rendered — curl the form and parse the embedded JSON `label` keys to enumerate them; there were 179 on 2026-09-05. Answer 'No, I am proactively reaching out', override axis 'New Orders', apply to 'Account ID' (not Domains — the 10k are distinct registered domains and the form caps that field at three). The Account ID is the ACME account URI, which is not in this repo: it is created at runtime by load_or_create_account (acme-engine/src/lib.rs) and cached at YUBABA_ACME_ACCOUNT_CACHE on the fleet, so read it off a voter.")
 //!
 //! @yah:ticket(R853-F4, "External Account Binding in acme-engine, so a second CA can absorb order overflow")
-//! @yah:at(2026-09-03T06:34:51Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:at(2026-09-08T21:00:14Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R853)
 //! @yah:depends_on(R853-T3)
-//! @yah:next("CONDITIONAL — build this ONLY if R853-T3 comes back refused. ZeroSSL and Google Trust Services both require External Account Binding, and acme-engine has none: confirmed by grep, there is no EAB code anywhere in the crate. The hook is instant-acme's NewAccount ExternalAccountKey, applied in load_or_create_account (oss/passway/crates/acme-engine/src/lib.rs) alongside the directory_root_cert fork R779 P8 added there.")
-//! @yah:next("THE STORAGE LAYOUT ALREADY ACCOMMODATES A SECOND CA — do not redesign it. Cert objects live at certs/&lt;issuer&gt;/&lt;domain&gt;/{cert.sealed,key.sealed,issuing}, where issuer is the ACME directory host (mirroring certmagic's certificates/&lt;issuer-key&gt;/&lt;domain&gt;/), so adding a CA is a write and not a migration. The ENROLLMENT set lives at enrolled/&lt;domain&gt;, deliberately OUTSIDE certs/&lt;issuer&gt;/, because enrolment is a fact about a tenant rather than about a CA — so a domain stays routable while its cert moves between CAs. See oss/yubaba/crates/yubaba/src/cert_store.rs.")
 //! @yah:gotcha("YOUR TRIGGER GOT LESS LIKELY, 2026-09-05 — read R853-T3 before starting. This ticket fires only if T3's rate-limit request comes back REFUSED, and the live numbers say the request may not need filing at all: New Orders per Account is 300/3h = 16,800/week, the fill is 10,000 orders (distinct registered domains, one identifier each), so it fits under the DEFAULT limit with 40% headroom. Renewals additionally draw ZERO from that budget — LE exempts both ARI and exact-identifier-set renewals from New Orders per Account. So the overflow-to-a-second-CA scenario this ticket exists to serve has no arithmetic behind it today. Do NOT start building EAB on a schedule; wait for an actual refusal, or for the domain target to move well past ~16.8k/week.")
 //! @yah:gotcha("IF IT DOES FIRE, one constraint the ticket does not mention: the New Certificates per Exact Set of Identifiers limit (5 per 7 days) is explicitly NON-overridable — 'We do not offer overrides for this limit' on letsencrypt.org, checked 2026-09-05. So a second CA is the only remedy for that particular limit, which is the one that bites when the FLEET wildcard's SAN list is widened repeatedly (see R853-T3's gotcha on the B9 interaction). That is a genuinely different motivation for EAB than order-volume overflow, and a stronger one.")
-//! @yah:next("TRIGGER IS NOW DEAD, 2026-09-05 — do not build this on the rationale it was filed with. This ticket's condition is 'build ONLY if R853-T3 comes back refused'. T3 is settled as NOT FILED (operator decision): the New Orders per Account limit does not bind on the 10k fill — 300/3h = 16,800/week against a 10,000-order fill, with renewals exempt entirely — so there is no request to be refused and the order-overflow scenario has no arithmetic behind it. Left open rather than closed because a DIFFERENT and stronger motivation surfaced while settling T3; that motivation is below, and whoever picks this up should re-file the justification around it rather than inherit the overflow framing.")
-//! @yah:next("THE MOTIVATION THAT SURVIVES is the New Certificates per Exact Set of Identifiers limit: 5 per 7 days, and letsencrypt.org states 'We do not offer overrides for this limit.' A second CA is therefore the ONLY remedy for it — unlike order volume, this one cannot be procured around at any price. It binds on the FLEET wildcard, whose identifier set is [yah.dev, *.yah.dev] + YUBABA_ACME_EXTRA_DOMAINS: widening that list leaves the non-ARI renewal exemption, so more than 5 widenings in a week gets refused outright. Whether that is worth EAB depends on how often the fleet SAN list actually changes, which is an operator question and not currently answerable — the fleet issuer has never issued (see R853-B9's gotcha: it is inert until R858-T3 makes raft leadership movable).")
-//! @yah:next("CHEAPER ALTERNATIVE TO WEIGH FIRST, if the exact-set limit is the real driver: adopt ARI in acme-engine instead of EAB. instant-acme 0.8.5 is already the dependency and we use no ARI today (grepped: no renewal_info / replaces anywhere). ARI renewals are exempt from ALL rate limits including the exact-set one, where non-ARI renewals are not. That is a smaller change than a second CA with external account binding, keeps one issuer, and does not touch the cert-store issuer axis at all. It does NOT help with a genuinely new identifier set — a first-ever widening is not a renewal under either scheme — so it narrows the problem rather than removing it.")
+//! @yah:next("EAB WAS NOT BUILT AND SHOULD NOT BE — every earlier next on this ticket is superseded, which is why they were replaced rather than left to argue with this one. What shipped instead is ARI. If a second CA is ever wanted again, the follow-on work is the yubaba half of ARI first (R853-F10), not External Account Binding.")
+//! @yah:handoff("EAB IS NOT BUILT, DELIBERATELY, AND THIS TICKET IS ANSWERED RATHER THAN DEFERRED. Its filed trigger (\"build only if R853-T3 comes back refused\") is dead — T3 settled as NOT FILED. Its one surviving motivation was the New Certificates per Exact Set of Identifiers limit (5 per 7 days, \"we do not offer overrides for this limit\"), which bites when a cert's SAN list is widened. That motivation is now answered without a second CA: letsencrypt.org, re-read live 2026-09-08, says an ARI renewal \"will not be subject to any rate limits\" and needs only \"at least one identifier matching the certificate it intends to replace\" — NOT the exact same set. So a widening is still a renewal under ARI, and ARI is much the cheaper remedy: no External Account Binding, no second issuer axis in the cert store, one CA.")
+//! @yah:handoff("WHAT SHIPPED — ARI (RFC 9773) IN acme-engine, END TO END. `ari_certificate_id(cert_chain_pem) -> Option<String>` (oss/passway/crates/acme-engine/src/lib.rs) reads the leaf's Authority Key Identifier and its DER-encoded serial with the x509-parser already there for `cert_dns_names`, and encodes them as instant-acme's `CertificateIdentifier`. `issue()` gained a third argument, `replaces: Option<&str>`, and `Issued` gained `renewed_via_ari: bool`. New dep: `rustls-pki-types = \"1.1\"`, solely for the `Der` newtype `CertificateIdentifier::new` takes — already in the graph via rustls, and instant-acme depends on it directly, so the identifier we build is the one it serializes.")
+//! @yah:handoff("THE FALLBACK IS THE LOAD-BEARING PART, and it is why this could not make issuance worse. If the directory does not implement ARI, or the CA declines the `replaces` (RFC 9773 §5 — already replaced, not ours, wrong CA), `issue` warns and re-orders WITHOUT it. A rejected new-order creates no order, so the retry costs a request and not a slot in the account's order budget. `Issued::renewed_via_ari` exists because that fallback is otherwise invisible: the certificate arrives either way and the only thing lost is the exemption, which does not surface until a LATER order is refused. passway's issuance log line now names which of the three cases happened.")
+//! @yah:handoff("PASSWAY IS WIRED AND GETS THE EXEMPTION TODAY; YUBABA IS NOT, ON PURPOSE. `issue_and_write` (oss/passway/crates/passway/src/acme.rs) reads whatever is at `config.cert_path` and names it as replaced — deliberately inside that one funnel rather than threaded down from `cert_needs_renewal`, so a third call site cannot start ordering without it. That directly covers the R853-B8 shape: a widened `PASSWAY_ACME_DOMAIN` is now still a renewal. Both yubaba issuers pass `None` with a comment naming what is missing, because their previous cert is a SEALED `SecretRecord` — the fix is a plaintext `SecretRecord::ari` beside `sans`, a raft surface change with the full R853-B9 epoch-re-record ceremony, filed with the whole design as R853-F10.")
+//! @yah:verify("PROVEN AGAINST A REAL ACME SERVER, not just unit-shaped. The Pebble integration test gained a third case (oss/passway/crates/acme-engine/tests/pebble_dns01_delegation.rs): issue, take `ari_certificate_id` off the returned leaf, re-order naming it as replaced, and assert `renewed_via_ari`. The assertion HAD to be that rather than \"issuance succeeded\", since the fallback would hand back a perfectly good cert with a wrongly-encoded identifier. `cargo test -p passway-acme --test pebble_dns01_delegation -- --ignored --nocapture` = 1 passed / 0 failed, in 3.07s; confirmed it was not silently skipping by re-running under PASSWAY_SKIP_DOCKER_TESTS=1, which prints \"[skip]\" and finishes in 0.00s.")
+//! @yah:verify("MUTATION CONTROL, because a test that only ever sees the happy path proves the CA is polite, not that our encoding is right. Corrupting the AKI segment of the id passed to `issue` (valid shape, wrong value) makes Pebble reject the order; the engine falls back and the new assertion fails with exactly its intended message — 1 failed / 0 passed. Restored and re-run green. So Pebble genuinely accepted the AKI+serial encoding, and the assertion has teeth.")
+//! @yah:verify("SUITES: cargo test --manifest-path oss/passway/Cargo.toml --workspace --lib = passway 138 / passway-acme 33 / passway-demux 19 / passway-http-router 25, 0 failed (acme-engine was 29 before this pass: +4 ARI unit tests). passway integration run directly as oss/passway/target/debug/deps/main-85f7d2c014f3e890 (the camp daemon has no keychain) = 28 passed / 0 failed. cargo clippy --manifest-path oss/passway/Cargo.toml --workspace --all-targets = exactly the 3 pre-existing warnings R853-B8 already recorded (auth.rs case-insensitive compare, path.rs Result<_,()>, proxy.rs manual Option::zip), nothing added. cargo deny check with the new rustls-pki-types dep = advisories ok, bans ok, licenses ok, sources ok.")
+//! @yah:gotcha("YUBABA DOES NOT COMPILE RIGHT NOW AND IT IS NOT THIS TICKET — do not attribute it here, and do not \"fix\" it. `cargo check --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib --tests` fails on 4 errors, all in R858's in-flight files: E0106 at crates/yubaba/src/ingress_effector.rs:468 and three E0277 (`Vec&lt;Entry&lt;..&gt;&gt;: Stream`) at crates/yubaba/src/raft/store.rs:1548/1555. @Ashguard:libra is live on R858 and the build rail flagged ingress_effector.rs, raft/mod.rs, lib.rs and quorum_health.rs as modified mid-run. My two yubaba edits are a comment and a `None` argument each; rustc reached the trait-solving phase (that is where the E0277s come from), so acme_issuer.rs and domain_issuer.rs WERE type-checked and neither is named in any error. STATED PLAINLY: I could not run yubaba's test suite, so the yubaba side of this change is compile-argued, not test-verified.")
+//! @yah:gotcha("ARI DOES NOT RESCUE A FIRST-EVER IDENTIFIER SET, which is the one limit-shaped thing it cannot do — a cert for names that share nothing with any cert we hold is a new certificate under both detection schemes. So the exemption covers widening an EXISTING cert (yah.dev + *.yah.dev gaining another name) and not standing up a brand-new one. The other half worth knowing: `ari_certificate_id` returns None for a leaf with no Authority Key Identifier extension, which is why the unit test mints its AKI case through a real rcgen CA rather than `generate_simple_self_signed` — rcgen writes AKI only when `use_authority_key_identifier_extension` is set, and a self-signed leaf from the existing helper has none.")
+//! @yah:handoff("SUPERSEDED IN ONE PARTICULAR, 2026-09-09 by R853-F10: the handoff above states \"Both yubaba issuers pass `None`\". They no longer do. `SecretRecord` gained the plaintext `ari: Option<String>` this ticket specified (raft/mod.rs, beside `sans`, #[serde(default)], with the matching field on YubabaRequest::PutSecret and its apply arm), and both issuers now pass the previous record's id as `acme_engine::issue`'s third argument — `acme_issuer::issue_and_store` via the new `replaces_id(cert_present)` seam, `domain_issuer::issue_domain` off the record it already fetched for the age check. Both also stamp `ari_certificate_id` of the freshly returned chain at issuance. The acme-engine side of F4 is unchanged and needed no edits; the rest of this annotation stands.")
 
 use std::collections::HashMap;
 use std::io;
@@ -91,9 +127,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use instant_acme::{
-    Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt,
-    NewAccount, NewOrder, OrderStatus, RetryPolicy,
+    Account, AccountCredentials, AuthorizationStatus, CertificateIdentifier, ChallengeType,
+    Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus, RetryPolicy,
 };
+use rustls_pki_types::Der;
 use tokio::sync::RwLock;
 
 /// Shared `token -> key_authorization` map the caller's HTTP-01 responder
@@ -265,6 +302,23 @@ pub struct Issued {
     pub cert_chain_pem: String,
     /// The PEM-encoded private key.
     pub key_pem: String,
+    /// R853-F4 — whether the CA took this order as an **ARI renewal**: a
+    /// `replaces` was supplied to [`issue`] and the order was accepted with it.
+    ///
+    /// `false` covers three different situations and deliberately does not
+    /// distinguish them, because the caller's response to all three is the
+    /// same: first issuance (nothing to replace), the directory not
+    /// implementing ARI, or the CA declining the `replaces` (already replaced,
+    /// or not ours) — in which case the engine re-ordered without it and the
+    /// warning names the reason.
+    ///
+    /// It exists because the fallback is otherwise invisible: the certificate
+    /// arrives either way, and the only thing lost is the rate-limit
+    /// exemption, which does not surface until a *later* order is refused.
+    /// Surfacing it here lets a caller log the difference, and lets the Pebble
+    /// integration test assert that a real ACME server accepted the identifier
+    /// we encoded rather than that issuance merely survived it.
+    pub renewed_via_ari: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +497,65 @@ pub fn cert_dns_names(cert_chain_pem: &str) -> Option<Vec<String>> {
         }
     }
     Some(names)
+}
+
+/// The RFC 9773 (ACME Renewal Information) certificate identifier of the
+/// **leaf** of a PEM chain — `"<base64url(AKI keyIdentifier)>.<base64url(DER
+/// serial)>"` — or `None` if the chain is unreadable or its leaf carries no
+/// Authority Key Identifier extension.
+///
+/// This is the value an order passes as `replaces` (see [`issue`]) to declare
+/// itself a renewal of that certificate. It is derived entirely from public
+/// certificate fields, so it is safe to store and log in the clear next to
+/// sealed cert material — which is the point: a caller can record it at
+/// issuance time and hand it back at renewal time without ever unsealing the
+/// previous cert.
+///
+/// `None` is the pre-ARI path, not an error. Every caller must be able to
+/// proceed without it: an order simply omits `replaces` and falls back to the
+/// CA's own exact-identifier-set renewal detection.
+pub fn ari_certificate_id(cert_chain_pem: &str) -> Option<String> {
+    let (_, pem) = x509_parser::pem::parse_x509_pem(cert_chain_pem.as_bytes()).ok()?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&pem.contents).ok()?;
+    // The AKI *keyIdentifier* specifically — the extension can instead carry
+    // only an issuer name + serial, and RFC 9773 §4.1 identifies a certificate
+    // by keyIdentifier, so that shape yields `None` rather than a wrong id.
+    let aki = cert.iter_extensions().find_map(|ext| {
+        match ext.parsed_extension() {
+            x509_parser::extensions::ParsedExtension::AuthorityKeyIdentifier(aki) => {
+                aki.key_identifier.as_ref().map(|k| k.0)
+            }
+            _ => None,
+        }
+    })?;
+    // `raw_serial()` is the ENCODED serial bytes, which is what RFC 9773 asks
+    // for — a big-integer rendering would drop a leading zero byte and produce
+    // an id the CA does not recognize.
+    Some(
+        CertificateIdentifier::new(
+            Der::from_slice(aki),
+            Der::from_slice(cert.tbs_certificate.raw_serial()),
+        )
+        .to_string(),
+    )
+}
+
+/// Parse an [`ari_certificate_id`] string back into the wire type.
+///
+/// The encoding is two base64url segments joined by a single `.`, so anything
+/// with a different number of segments — or an empty one — is rejected rather
+/// than half-parsed into an id the CA would reject on our behalf. Since a
+/// caller stores this value across restarts, a corrupt one must degrade to the
+/// no-ARI path, not to a failed order.
+fn parse_ari_certificate_id(id: &str) -> Option<CertificateIdentifier<'_>> {
+    let (aki, serial) = id.split_once('.')?;
+    if aki.is_empty() || serial.is_empty() || serial.contains('.') {
+        return None;
+    }
+    Some(CertificateIdentifier {
+        authority_key_identifier: aki.into(),
+        serial: serial.into(),
+    })
 }
 
 /// Which of `wanted` the SAN set `have` does **not** cover — empty means the
@@ -700,12 +813,54 @@ async fn load_or_create_account(config: &IssueConfig) -> Result<Account, AcmeErr
 /// `_acme-challenge` TXT records via the Cloudflare API — then finalize and
 /// return the resulting cert chain + key as [`Issued`]. This engine never
 /// touches the cert-to-disk path; the caller decides where the bytes land.
-pub async fn issue(config: &IssueConfig, tokens: &ChallengeTokens) -> Result<Issued, AcmeError> {
+///
+/// `replaces` is the RFC 9773 (ARI) identifier of the certificate this order
+/// renews — [`ari_certificate_id`] of the chain currently held, or `None` on a
+/// first issuance. Passing it is what makes the order a *renewal* to the CA
+/// rather than a brand-new certificate, and Let's Encrypt exempts ARI renewals
+/// from **all** rate limits (checked live 2026-09-08). Crucially the exemption
+/// needs only one identifier in common with the replaced cert, not the exact
+/// same set — so widening a SAN list stays a renewal, which is the only way
+/// past the New Certificates per Exact Set of Identifiers limit (5 per 7 days,
+/// and "we do not offer overrides for this limit"). See R853-F4.
+///
+/// Every ARI failure is non-fatal by construction: if the directory does not
+/// implement ARI, or rejects the `replaces` (RFC 9773 §5 — the certificate was
+/// already replaced, or is not ours), the order is retried once without it.
+/// The fallback is exactly the pre-ARI behaviour, so this can never turn an
+/// issuance that would have worked into one that does not.
+pub async fn issue(
+    config: &IssueConfig,
+    tokens: &ChallengeTokens,
+    replaces: Option<&str>,
+) -> Result<Issued, AcmeError> {
     let account = load_or_create_account(config).await?;
 
     let identifiers: Vec<Identifier> =
         config.domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
-    let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
+    let mut renewed_via_ari = false;
+    let mut order = match replaces.and_then(parse_ari_certificate_id) {
+        None => account.new_order(&NewOrder::new(&identifiers)).await?,
+        Some(previous) => {
+            // A rejected new-order creates no order, so the retry costs a
+            // request and not a slot in the account's order budget.
+            match account.new_order(&NewOrder::new(&identifiers).replaces(previous)).await {
+                Ok(order) => {
+                    renewed_via_ari = true;
+                    order
+                }
+                Err(e) => {
+                    log::warn!(
+                        "acme-engine: the CA would not take this order as an ARI renewal of {} \
+                         ({e}) — re-ordering without it, which forfeits the renewal \
+                         rate-limit exemption but not the certificate",
+                        replaces.unwrap_or_default()
+                    );
+                    account.new_order(&NewOrder::new(&identifiers)).await?
+                }
+            }
+        }
+    };
 
     // DNS-01 collateral, resolved once up front. The token lives in a
     // root-readable file, not the environment — see [`AcmeChallengeKind`].
@@ -910,7 +1065,7 @@ pub async fn issue(config: &IssueConfig, tokens: &ChallengeTokens) -> Result<Iss
         config.domains.join(", "),
         config.directory.url(),
     );
-    Ok(Issued { cert_chain_pem, key_pem })
+    Ok(Issued { cert_chain_pem, key_pem, renewed_via_ari })
 }
 
 // ---------------------------------------------------------------------------
@@ -1025,6 +1180,71 @@ mod tests {
         let leaf = self_signed_pem(&["leaf.test"]);
         let issuer = self_signed_pem(&["issuer.test"]);
         assert_eq!(cert_dns_names(&format!("{leaf}{issuer}")).expect("chain parses"), owned(&["leaf.test"]));
+    }
+
+    // -- ari_certificate_id / parse_ari_certificate_id -------------------
+
+    /// A CA-issued leaf always carries an Authority Key Identifier; a
+    /// `generate_simple_self_signed` cert does not (rcgen writes it only when
+    /// `use_authority_key_identifier_extension` is set). Minting the AKI case
+    /// through a real signer keeps this asserting about DER rather than about
+    /// a fixture.
+    fn leaf_with_aki_pem() -> String {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new()).expect("ca params");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().expect("ca key");
+        let ca = ca_params.self_signed(&ca_key).expect("ca cert");
+        let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
+
+        let mut leaf_params =
+            rcgen::CertificateParams::new(vec!["yah.dev".to_string()]).expect("leaf params");
+        leaf_params.use_authority_key_identifier_extension = true;
+        let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
+        let leaf = leaf_params.signed_by(&leaf_key, &issuer).expect("leaf cert");
+        format!("{}{}", leaf.pem(), ca.pem())
+    }
+
+    /// The id is the ARI wire form: two non-empty base64url segments joined by
+    /// exactly one `.`. Getting the shape wrong yields an order the CA rejects,
+    /// which the engine then silently retries without ARI — i.e. the exemption
+    /// would be lost with nothing louder than a warning to show for it.
+    #[test]
+    fn the_ari_id_of_a_real_leaf_is_two_base64url_segments() {
+        let id = ari_certificate_id(&leaf_with_aki_pem()).expect("a CA-signed leaf has an AKI");
+        let (aki, serial) = id.split_once('.').expect("one '.' separator");
+        assert!(!aki.is_empty() && !serial.is_empty(), "{id}");
+        assert!(!serial.contains('.'), "{id}");
+        assert!(
+            id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'),
+            "base64url, unpadded: {id}"
+        );
+        assert_eq!(parse_ari_certificate_id(&id).map(|c| c.to_string()), Some(id.clone()));
+    }
+
+    /// `None` is the no-ARI path, and every caller must be able to walk it —
+    /// so it has to be reachable for material we cannot read AND for a cert
+    /// that is fine but simply carries no AKI, never a panic and never a
+    /// half-built id.
+    #[test]
+    fn material_without_a_readable_aki_has_no_ari_id() {
+        assert!(ari_certificate_id("").is_none());
+        assert!(ari_certificate_id("-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n").is_none());
+        assert!(
+            ari_certificate_id(&self_signed_pem(&["yah.dev"])).is_none(),
+            "a self-signed leaf with no AKI extension cannot be ARI-identified"
+        );
+    }
+
+    /// A stored id is round-tripped through someone else's storage (a raft
+    /// record, a file), so a corrupt one has to degrade to "no ARI" rather
+    /// than to an order the CA refuses.
+    #[test]
+    fn a_malformed_stored_ari_id_parses_to_none() {
+        assert!(parse_ari_certificate_id("").is_none());
+        assert!(parse_ari_certificate_id("no-separator").is_none());
+        assert!(parse_ari_certificate_id(".serial").is_none());
+        assert!(parse_ari_certificate_id("aki.").is_none());
+        assert!(parse_ari_certificate_id("aki.serial.extra").is_none());
     }
 
     // -- is_renewal_due (pure) -----------------------------------------
