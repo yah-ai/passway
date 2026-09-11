@@ -303,3 +303,134 @@ async fn a_door_pointed_at_an_unreadable_table_refuses_to_start() {
         "the refusal must name the variable that pointed at the missing file; said: {said}"
     );
 }
+
+// ── R870-F23: the cleartext inner door ───────────────────────────────────────
+
+/// Fork a real `passway` in `PASSWAY_TLS_MODE=plaintext`. Deliberately NOT a
+/// flag on [`spawn_door`]: that helper writes and passes a leaf, and a door
+/// carrying `PASSWAY_TLS_CERT` is exactly what the mode refuses. Two spawners
+/// is the honest shape — a cleartext door has no certificate at any point.
+fn spawn_plaintext_door(
+    scratch: &Scratch,
+    listen: SocketAddr,
+    routes: &std::path::Path,
+) -> tokio::process::Child {
+    let mut cmd = tokio::process::Command::new(PathBuf::from(env!("CARGO_BIN_EXE_passway")));
+    cmd.env("PASSWAY_TLS_MODE", "plaintext")
+        .env("PASSWAY_LISTEN", listen.to_string())
+        .env("PASSWAY_PATH_ROUTES_FILE", routes)
+        .env("PASSWAY_PID_FILE", scratch.path("pingora.pid"))
+        .env("PASSWAY_UPGRADE_SOCK", scratch.path("pingora_upgrade.sock"))
+        .env("PASSWAY_HEALTH_CHECK_INTERVAL_SECS", "1")
+        .env_remove("PASSWAY_TLS_CERT")
+        .env_remove("PASSWAY_TLS_KEY")
+        .env_remove("PASSWAY_UPSTREAM_SOURCE")
+        .env_remove("PASSWAY_UPSTREAMS")
+        .env_remove("PASSWAY_YUBABA_URL")
+        .env_remove("PASSWAY_YUBABA_IDENT")
+        .env_remove("LISTEN_FDS")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    cmd.spawn().expect("spawn plaintext passway")
+}
+
+async fn get_plaintext_until_ok(
+    client: &reqwest::Client,
+    listen: SocketAddr,
+    path: &str,
+) -> reqwest::Response {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(resp) = client.get(format!("http://{listen}{path}")).send().await {
+            if resp.status().is_success() {
+                return resp;
+            }
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("GET {path} never returned 200 through the cleartext door within 20s");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// THE MODE R870-F23'S OPERATOR CALL AUTHORIZED, proven through the binary.
+///
+/// The whole point of the inner tier is that it costs a process and nothing
+/// else — no certificate, no renewal story, no loopback handshake. This is the
+/// assertion that it actually does: a real passway with NO cert configured at
+/// all serves the same two-mount split, with the same per-mount headers, over
+/// cleartext HTTP on loopback.
+#[tokio::test]
+async fn a_cleartext_inner_door_serves_the_same_mount_table_with_no_certificate() {
+    let scratch = Scratch::new("plaintext");
+    let site = common::spawn_fake_upstream("site").await;
+    let app = common::spawn_fake_upstream("app").await;
+
+    let routes = scratch.path("inner.routes.json");
+    std::fs::write(
+        &routes,
+        format!(
+            r#"{{ "schema_version": 1,
+                  "routes": [
+                    {{ "mount": "", "upstreams": ["{site}"] }},
+                    {{ "mount": "/app", "upstreams": ["{app}"],
+                       "headers": {{ "cross-origin-opener-policy": "same-origin" }} }}
+                  ] }}"#
+        ),
+    )
+    .expect("write routes file");
+
+    let listen = common::free_addr();
+    let _door = spawn_plaintext_door(&scratch, listen, &routes);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("build plain client");
+
+    let root = get_plaintext_until_ok(&client, listen, "/").await;
+    assert_eq!(tag(&root), "site");
+    assert!(
+        root.headers().get("cross-origin-opener-policy").is_none(),
+        "the root mount declares no headers and must gain none"
+    );
+
+    let mounted = get_plaintext_until_ok(&client, listen, "/app/").await;
+    assert_eq!(tag(&mounted), "app");
+    assert_eq!(
+        mounted
+            .headers()
+            .get("cross-origin-opener-policy")
+            .and_then(|v| v.to_str().ok()),
+        Some("same-origin"),
+    );
+}
+
+/// The invariant that makes the mode safe, asserted against the binary rather
+/// than only against the parser: a cleartext door bound anywhere reachable
+/// does not start. `0.0.0.0` is the DEFAULT bind, so this is the single
+/// misconfiguration that turns an inner door into a public cleartext one.
+#[tokio::test]
+async fn a_cleartext_door_on_a_reachable_bind_refuses_to_start() {
+    let scratch = Scratch::new("plaintext-public");
+    let routes = scratch.path("inner.routes.json");
+    std::fs::write(&routes, r#"{"schema_version":1,"routes":[{"mount":"","upstreams":["127.0.0.1:1"]}]}"#)
+        .expect("write routes file");
+
+    let door = spawn_plaintext_door(&scratch, "0.0.0.0:0".parse().unwrap(), &routes);
+    let out = tokio::time::timeout(Duration::from_secs(30), door.wait_with_output())
+        .await
+        .expect("a cleartext door on a public bind must exit, not serve")
+        .expect("collect the refused door's output");
+    assert!(!out.status.success(), "expected a non-zero exit");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        said.contains("not loopback"),
+        "the refusal must name the bind as the reason; said: {said}"
+    );
+}

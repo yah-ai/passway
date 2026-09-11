@@ -8,10 +8,10 @@
 //!
 //! | Variable | Meaning | Default |
 //! |---|---|---|
-//! | `PASSWAY_LISTEN` | TLS listener address | `0.0.0.0:443` |
-//! | `PASSWAY_TLS_CERT` | PEM cert chain path | required |
-//! | `PASSWAY_TLS_KEY` | PEM private key path | required |
-//! | `PASSWAY_TLS_MODE` | `manual` (bring-your-own-cert) or `acme` (R594-F7) | `manual` |
+//! | `PASSWAY_LISTEN` | listener address | `0.0.0.0:443` |
+//! | `PASSWAY_TLS_CERT` | PEM cert chain path | required unless `PASSWAY_TLS_MODE=plaintext` |
+//! | `PASSWAY_TLS_KEY` | PEM private key path | required unless `PASSWAY_TLS_MODE=plaintext` |
+//! | `PASSWAY_TLS_MODE` | `manual` (bring-your-own-cert), `acme` (R594-F7), or `plaintext` (R870-F23: no TLS at all — the loopback *inner door*, which splits one hostname across independently-deployed units by path behind a public door that already terminated TLS). `plaintext` is refused unless `PASSWAY_LISTEN` is a literal loopback socket address, no cert vars are set, and `LISTEN_FDS` is unset; see [`passway::tls::parse_listener_tls_mode`] | `manual` |
 //! | `PASSWAY_ALPN` | R870-T21: which application protocols the TLS listener offers. `h2,http/1.1` or `http/1.1`. Set it to `http/1.1` on a door fronting a protocol negotiated by an HTTP/1.1 `Upgrade:` handshake (TS2021, RFC-6455 WebSocket) — RFC 9113 §8.2.2 forbids `Upgrade` over h2, so such a request cannot survive an h2 connection at all. An unrecognized value is a boot failure, not the default | `h2,http/1.1` |
 //! | `PASSWAY_ACME_DOMAIN` | comma-separated SAN list to issue for (wildcards need `dns-01`) | required if `PASSWAY_TLS_MODE=acme` |
 //! | `PASSWAY_ACME_CONTACT_EMAIL` | ACME account contact | required if `PASSWAY_TLS_MODE=acme` |
@@ -406,7 +406,9 @@ use passway::path_routes_file::ROUTES_FILE_ENV;
 use passway::proxy::PassProxy;
 use passway::redirect;
 use passway::routing::{build_host_router, HostKey, UpstreamOpts, UpstreamSet, CATCH_ALL_LABEL};
-use passway::tls::{build_tls_settings, parse_alpn_policy, TlsMode};
+use passway::tls::{
+    build_tls_settings, parse_alpn_policy, parse_listener_tls_mode, ListenerTlsMode, TlsMode,
+};
 use passway::upstream::{StaticUpstreams, UpstreamSource};
 
 fn env_or(key: &str, default: &str) -> String {
@@ -1174,8 +1176,24 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let listen = env_or("PASSWAY_LISTEN", "0.0.0.0:443");
-    let cert_path = std::env::var("PASSWAY_TLS_CERT").expect("PASSWAY_TLS_CERT is required");
-    let key_path = std::env::var("PASSWAY_TLS_KEY").expect("PASSWAY_TLS_KEY is required");
+
+    // R870-F23. Read before the cert paths, because `plaintext` is the one
+    // mode that has none: a loopback inner door terminates no TLS, so
+    // requiring `PASSWAY_TLS_CERT` of it would be requiring a certificate for
+    // `127.0.0.1`. Every guard that keeps cleartext off a reachable listener
+    // lives in `parse_listener_tls_mode` and none of it is re-implemented
+    // here — see that function.
+    let listener_tls = parse_listener_tls_mode(|k| std::env::var(k).ok(), &listen)
+        .unwrap_or_else(|e| panic!("invalid TLS-mode configuration: {e}"));
+    let plaintext_listener = listener_tls == ListenerTlsMode::Plaintext;
+    let (cert_path, key_path) = if plaintext_listener {
+        (String::new(), String::new())
+    } else {
+        (
+            std::env::var("PASSWAY_TLS_CERT").expect("PASSWAY_TLS_CERT is required"),
+            std::env::var("PASSWAY_TLS_KEY").expect("PASSWAY_TLS_KEY is required"),
+        )
+    };
 
     // R870-T21. Parsed HERE, before the ACME bootstrap below, because that can
     // block for minutes on a first-boot issuance — a mistyped ALPN offer must
@@ -1210,12 +1228,13 @@ fn main() {
         }
     }
 
-    let tls_mode = match &acme_config {
-        Some(_) => TlsMode::Acme {
+    let tls_mode = match (&acme_config, plaintext_listener) {
+        (_, true) => TlsMode::Plaintext,
+        (Some(_), false) => TlsMode::Acme {
             cert_path: cert_path.clone(),
             key_path: key_path.clone(),
         },
-        None => TlsMode::Manual {
+        (None, false) => TlsMode::Manual {
             cert_path: cert_path.clone(),
             key_path: key_path.clone(),
         },
@@ -1466,9 +1485,17 @@ fn main() {
     }
 
     let mut proxy_service = pingora::proxy::http_proxy_service(&server.configuration, proxy);
-    let tls_settings = build_tls_settings(&tls_mode, alpn_policy)
-        .expect("failed to build TLS settings — check PASSWAY_TLS_CERT / PASSWAY_TLS_KEY");
-    proxy_service.add_tls_with_settings(&listen, None, tls_settings);
+    if plaintext_listener {
+        // R870-F23: the loopback inner door. No handshake, so no ALPN offer
+        // either — a cleartext listener cannot negotiate h2, and pingora's
+        // plain-TCP path speaks HTTP/1.1. That is what the public door in
+        // front of it already speaks to upstreams.
+        proxy_service.add_tcp(&listen);
+    } else {
+        let tls_settings = build_tls_settings(&tls_mode, alpn_policy)
+            .expect("failed to build TLS settings — check PASSWAY_TLS_CERT / PASSWAY_TLS_KEY");
+        proxy_service.add_tls_with_settings(&listen, None, tls_settings);
+    }
 
     server.add_service(proxy_service);
     for lb_service in lb_services {

@@ -207,12 +207,19 @@
 //! @yah:verify("ACTIVATED AND PROVEN ON BOTH LIVE DOORS 2026-09-08 by @Ashguard:dragon. Drop-in installed at /etc/systemd/system/passway-test.service.d/ (east) and /etc/systemd/system/passway.service.d/ (south); one connection-dropping restart each, both came up Type=notify clean (\"notified systemd READY with MAINPID\"), ACME skipped issuance (cert fresh). Then a REAL reload under load on south: 120 sequential https://yah.dev/ requests against 127.0.0.1:443 while `systemctl reload passway.service` ran. Result 119x200 / 1x503, MainPID 2809164 -> 2809418, unit stayed active. Journal shows the handover working exactly as designed: \"Trying to send socks\" -> \"listener sockets sent\" -> replacement listening on /run/passway-test-upgrade.sock -> SIGQUIT to the old pid -> \"passway.service main pid is now 2809418; 2809164 is draining\". Upgrade socks are pinned per-instance on both nodes (passway-test/passway = /run/passway-test-upgrade.sock, passway-mesh = /run/passway-mesh-upgrade.sock), so the three-way contention this ticket's conf warns about does not apply here.")
 //! @yah:gotcha("RELOAD IS ZERO-CONNECTION-DROP BUT NOT ZERO-ERROR: measured 1x503 in 120 requests across a reload on us-south-001, 2026-09-08. Not a torn handover — the listener transfer succeeded and no connection was refused or reset. The 503 comes from the REPLACEMENT process, which starts with an EMPTY upstream set: passway re-runs upstream discovery from scratch on every start (PASSWAY_UPSTREAM_SOURCE=yubaba, polling /service-records?ready=true for ident yah-marketing), so for roughly one second after it takes the socket it is serving with nothing healthy behind it. The old process has already had SIGQUIT by then, so there is nothing to fall back to. Consequence for the thing this drop-in exists for: every unattended cert rotation will emit a short 503 burst on that origin, which is much better than dropping connections but is NOT the \"costs nothing\" the conf header claims. The fix shape is to hold READY=1 / the socket handover until the first upstream health poll has produced at least one ready backend, i.e. make discovery part of the readiness gate rather than a background service started after it.")
 
+use std::net::SocketAddr;
+
 use pingora::listeners::tls::TlsSettings;
 use pingora::protocols::ALPN;
 
 /// How passway terminates TLS for its public listener.
 #[derive(Debug, Clone)]
 pub enum TlsMode {
+    /// **No TLS at all** — a cleartext HTTP listener, and the one variant
+    /// here that is not a trust boundary. Reachable only through
+    /// [`parse_listener_tls_mode`], which refuses it on anything but a
+    /// loopback bind; see that function for the whole argument.
+    Plaintext,
     /// Bring-your-own-cert: a PEM certificate chain and a PEM private key
     /// on disk, loaded once at startup (mirrors mshr's `tls_manual`). The
     /// default and fallback — nothing manages these files but the
@@ -227,6 +234,123 @@ pub enum TlsMode {
     /// calling `acme::ensure_cert_on_disk` first (see that function and
     /// this module's "First-boot bootstrapping" doc above).
     Acme { cert_path: String, key_path: String },
+}
+
+/// The env var naming the listener's TLS mode. Three values, spelled below.
+pub const TLS_MODE_ENV: &str = "PASSWAY_TLS_MODE";
+
+/// Which of [`TlsMode`]'s three shapes [`TLS_MODE_ENV`] selects, before the
+/// cert paths (which `plaintext` does not have) are read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerTlsMode {
+    /// `PASSWAY_TLS_MODE=plaintext` — [`TlsMode::Plaintext`].
+    Plaintext,
+    /// Unset, empty, or `manual` — [`TlsMode::Manual`].
+    Manual,
+    /// `PASSWAY_TLS_MODE=acme` — [`TlsMode::Acme`], configured further by
+    /// [`crate::acme::parse_acme_config`].
+    Acme,
+}
+
+/// Decide the listener's TLS mode, and refuse a cleartext one anywhere it
+/// would be a trust boundary (R870-F23).
+///
+/// ## Why passway has a cleartext mode at all
+///
+/// R870's *inner door* is a passway process a service runs in front of its
+/// own components, on loopback, behind that service's public door. It exists
+/// to do one thing the public door cannot: split one hostname across several
+/// independently-deployed units by URL path. It is not reachable from the
+/// network, and the hop it terminates has already been decrypted by the
+/// public door one process earlier on the same box.
+///
+/// Before this, `main()` terminated TLS unconditionally, so an inner door
+/// needed a certificate for `127.0.0.1`. That is worse than it sounds, and
+/// the reason is measurable rather than aesthetic: **no CA issues for a
+/// loopback address**, so the cert has to be self-signed — and pingora's
+/// `HttpPeer` defaults to `verify_cert: true`
+/// (`pingora-core-0.8.1/src/upstreams/peer.rs:479`), which passway never
+/// overrides. So "keep TLS everywhere" does not buy safety here; it buys a
+/// second, *worse* change — a way to switch off upstream certificate
+/// verification on a public-facing door, which is a real trust-boundary knob,
+/// in exchange for encrypting a hop that never leaves the loopback interface.
+/// Operator call, 2026-09-09: take the cleartext loopback listener instead.
+///
+/// ## The invariant, and why it is checked here rather than documented
+///
+/// A cleartext mode is only ever safe because of a property of the *bind
+/// address*, and an operator remembering not to misconfigure it is not a
+/// property. So this function refuses, at boot, every combination that would
+/// put cleartext where something other than the local machine could reach it:
+///
+/// - the bind must be a literal loopback socket address (`127.0.0.0/8`,
+///   `::1`). `0.0.0.0:443` — the default — is refused, and so is a name this
+///   function cannot resolve to an address it can inspect;
+/// - `PASSWAY_TLS_CERT` / `PASSWAY_TLS_KEY` must be unset, so a door that was
+///   configured as a public one does not become cleartext by adding a
+///   variable rather than by removing two;
+/// - socket activation (`LISTEN_FDS`) is refused outright: the socket was
+///   bound by the supervisor, so `PASSWAY_LISTEN` is a *lookup key* there and
+///   not evidence of what the listener is actually bound to — the invariant
+///   would be unverifiable exactly where it matters most.
+///
+/// Each of those is a boot failure naming what to change. None of them is a
+/// warning: a door that half-honours this would serve cleartext publicly,
+/// which is the single outcome the mode must not be able to produce.
+pub fn parse_listener_tls_mode(
+    get: impl Fn(&str) -> Option<String>,
+    listen: &str,
+) -> Result<ListenerTlsMode, String> {
+    let raw = get(TLS_MODE_ENV).unwrap_or_default();
+    match raw.trim() {
+        "" | "manual" => return Ok(ListenerTlsMode::Manual),
+        "acme" => return Ok(ListenerTlsMode::Acme),
+        "plaintext" => {}
+        other => {
+            return Err(format!(
+                "{TLS_MODE_ENV} {other:?}: expected `manual` (the default — leave it unset), \
+                 `acme`, or `plaintext` (a loopback-only inner door, see \
+                 PASSWAY_PATH_ROUTES_FILE)"
+            ))
+        }
+    }
+
+    if get("LISTEN_FDS").is_some() {
+        return Err(format!(
+            "{TLS_MODE_ENV}=plaintext with LISTEN_FDS set: the listening socket was bound by \
+             the supervisor, so PASSWAY_LISTEN is only the key this process looks it up by and \
+             proves nothing about what it is bound to. A cleartext listener is allowed solely \
+             because its bind is loopback, and that cannot be checked here — start this door \
+             without socket activation, or terminate TLS on it"
+        ));
+    }
+
+    for var in ["PASSWAY_TLS_CERT", "PASSWAY_TLS_KEY"] {
+        if get(var).is_some_and(|v| !v.trim().is_empty()) {
+            return Err(format!(
+                "{TLS_MODE_ENV}=plaintext but {var} is also set — a door configured to serve a \
+                 certificate must not become cleartext by ADDING one variable. Unset {var} (and \
+                 its pair) if this really is a loopback inner door; otherwise drop \
+                 {TLS_MODE_ENV}"
+            ));
+        }
+    }
+
+    let addr: SocketAddr = listen.parse().map_err(|_| {
+        format!(
+            "{TLS_MODE_ENV}=plaintext but PASSWAY_LISTEN {listen:?} is not a literal socket \
+             address, so this process cannot prove the bind is loopback. Write it as an IP and \
+             port — `127.0.0.1:<port>` or `[::1]:<port>`"
+        )
+    })?;
+    if !addr.ip().is_loopback() {
+        return Err(format!(
+            "{TLS_MODE_ENV}=plaintext but PASSWAY_LISTEN {listen:?} is not loopback. Cleartext \
+             is allowed only on a listener nothing off this machine can reach; bind \
+             `127.0.0.1:<port>` or `[::1]:<port>`, or terminate TLS on this door"
+        ));
+    }
+    Ok(ListenerTlsMode::Plaintext)
 }
 
 /// The env var a door sets to narrow its ALPN offer. See [`AlpnPolicy`].
@@ -346,6 +470,19 @@ pub fn parse_alpn_policy(get: impl Fn(&str) -> Option<String>) -> Result<AlpnPol
 /// @yah:verify("LEADER CONTENT VERIFICATION (session:abde2cbb): the opt-out landed as described — `pub enum AlpnPolicy` at oss/passway/crates/passway/src/tls.rs:262 and `pub fn parse_alpn_policy` at :292, i.e. a changed signature rather than a parallel constructor beside the old unconditional enable_h2(), which is what the below-v1.0.0 rule asked for. Combined with my earlier run of the full passway suite at 275 passed / 0 failed, this ticket is verified on both axes despite its own baseline having been blocked by a peer timing artifact at the time it ran.")
 pub fn build_tls_settings(mode: &TlsMode, alpn: AlpnPolicy) -> pingora::Result<TlsSettings> {
     let (cert_path, key_path) = match mode {
+        // Unreachable through `main()`, which branches on the variant before
+        // it gets here (a plaintext listener is `add_tcp`, not
+        // `add_tls_with_settings`). An `Err` rather than a panic so a future
+        // caller that gets the branch wrong fails to *start* with the reason,
+        // which is the same outcome every other error on this path has.
+        TlsMode::Plaintext => {
+            return Err(pingora::Error::explain(
+                pingora::ErrorType::InternalError,
+                "build_tls_settings called on TlsMode::Plaintext — a cleartext listener has no \
+                 certificate to build settings from; the caller should have added a plain TCP \
+                 listener instead",
+            ))
+        }
         TlsMode::Manual { cert_path, key_path } => (cert_path, key_path),
         TlsMode::Acme { cert_path, key_path } => (cert_path, key_path),
     };
@@ -360,6 +497,108 @@ pub fn build_tls_settings(mode: &TlsMode, alpn: AlpnPolicy) -> pingora::Result<T
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An env getter over a fixed `(key, value)` table — nothing else is set.
+    fn env<'a>(pairs: &'a [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    const LOOPBACK: &str = "127.0.0.1:8443";
+
+    #[test]
+    fn an_unset_tls_mode_is_manual_and_the_public_default_bind_stays_allowed() {
+        // The assertion that makes R870-F23 opt-IN: every door on the fleet
+        // today leaves PASSWAY_TLS_MODE unset, on 0.0.0.0:443, and must be
+        // unaffected — including by the loopback guard, which must not run.
+        assert_eq!(
+            parse_listener_tls_mode(env(&[]), "0.0.0.0:443").unwrap(),
+            ListenerTlsMode::Manual
+        );
+        assert_eq!(
+            parse_listener_tls_mode(env(&[("PASSWAY_TLS_MODE", "manual")]), "0.0.0.0:443").unwrap(),
+            ListenerTlsMode::Manual
+        );
+        assert_eq!(
+            parse_listener_tls_mode(env(&[("PASSWAY_TLS_MODE", "acme")]), "0.0.0.0:443").unwrap(),
+            ListenerTlsMode::Acme
+        );
+    }
+
+    #[test]
+    fn plaintext_is_accepted_on_a_loopback_bind_in_both_families() {
+        for listen in [LOOPBACK, "127.0.0.2:9000", "[::1]:8443"] {
+            assert_eq!(
+                parse_listener_tls_mode(env(&[("PASSWAY_TLS_MODE", "plaintext")]), listen).unwrap(),
+                ListenerTlsMode::Plaintext,
+                "{listen} is loopback"
+            );
+        }
+    }
+
+    #[test]
+    fn plaintext_on_a_reachable_bind_is_a_boot_failure() {
+        // The invariant the mode exists under. `0.0.0.0:443` is the DEFAULT
+        // bind, so this is the exact misconfiguration a door would fall into
+        // by setting one variable and forgetting the other.
+        for listen in ["0.0.0.0:443", "0.0.0.0:8443", "10.0.0.4:8443", "[::]:443"] {
+            let err = parse_listener_tls_mode(env(&[("PASSWAY_TLS_MODE", "plaintext")]), listen)
+                .expect_err("{listen} is publicly reachable");
+            assert!(err.contains("not loopback"), "{listen}: {err}");
+        }
+    }
+
+    #[test]
+    fn plaintext_on_an_unparseable_bind_is_refused_rather_than_resolved() {
+        // A hostname could resolve to a loopback address, or could not, and
+        // this process is not the place that finds out. Refuse: the mode is
+        // safe only when the bind is *provably* loopback.
+        for listen in ["localhost:8443", "inner.local:8443", "8443"] {
+            let err = parse_listener_tls_mode(env(&[("PASSWAY_TLS_MODE", "plaintext")]), listen)
+                .expect_err("not a literal socket address");
+            assert!(err.contains("not a literal socket address"), "{listen}: {err}");
+        }
+    }
+
+    #[test]
+    fn plaintext_beside_a_configured_certificate_is_refused() {
+        for var in ["PASSWAY_TLS_CERT", "PASSWAY_TLS_KEY"] {
+            let err = parse_listener_tls_mode(
+                env(&[("PASSWAY_TLS_MODE", "plaintext"), (var, "/etc/passway/tenant.crt")]),
+                LOOPBACK,
+            )
+            .expect_err("a door with a cert must not go cleartext by adding a variable");
+            assert!(err.contains(var), "{var}: {err}");
+        }
+    }
+
+    #[test]
+    fn plaintext_under_socket_activation_is_refused_because_the_bind_is_unprovable() {
+        let err = parse_listener_tls_mode(
+            env(&[("PASSWAY_TLS_MODE", "plaintext"), ("LISTEN_FDS", "1")]),
+            LOOPBACK,
+        )
+        .expect_err("PASSWAY_LISTEN is only a lookup key under LISTEN_FDS");
+        assert!(err.contains("LISTEN_FDS"), "{err}");
+    }
+
+    #[test]
+    fn a_misspelled_tls_mode_is_a_boot_failure_not_a_silent_manual() {
+        for raw in ["plaintxt", "PLAINTEXT", "none", "cleartext", "http"] {
+            let err = parse_listener_tls_mode(env(&[("PASSWAY_TLS_MODE", raw)]), LOOPBACK)
+                .expect_err("unrecognized mode");
+            assert!(err.contains("expected `manual`"), "{raw}: {err}");
+        }
+    }
+
+    #[test]
+    fn build_tls_settings_refuses_the_plaintext_variant_rather_than_panicking() {
+        assert!(build_tls_settings(&TlsMode::Plaintext, AlpnPolicy::default()).is_err());
+    }
 
     /// An env getter where [`ALPN_ENV`] holds `value` and nothing else is set.
     fn alpn_env(value: Option<&'static str>) -> impl Fn(&str) -> Option<String> {
