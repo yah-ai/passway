@@ -28,6 +28,7 @@ use passway::auth::{CheersAuth, RouteAuthPolicy};
 use passway::path_route::{build_path_router, MountSource};
 use passway::proxy::PassProxy;
 use passway::routing::{build_host_router, HostKey, UpstreamSet};
+use passway::trace::SpanExportService;
 use passway::upstream::{build_load_balancer, StaticUpstreams, UpstreamSource};
 
 /// Reserve an ephemeral local port and immediately release it. Small
@@ -115,6 +116,22 @@ pub fn start_proxy_multi(
     >,
     listen: SocketAddr,
 ) {
+    start_proxy_traced(proxy, lb_backgrounds, listen, None);
+}
+
+/// [`start_proxy_multi`] plus R893-F16's span exporter, which is an ordinary
+/// pingora background service and must be added to the same server or nothing
+/// ever drains the span queue.
+pub fn start_proxy_traced(
+    proxy: PassProxy,
+    lb_backgrounds: Vec<
+        pingora::services::background::GenBackgroundService<
+            pingora::lb::LoadBalancer<pingora::lb::selection::RoundRobin>,
+        >,
+    >,
+    listen: SocketAddr,
+    spans: Option<pingora::services::background::GenBackgroundService<SpanExportService>>,
+) {
     std::thread::spawn(move || {
         let mut server = Server::new(None).expect("construct pingora Server");
         server.bootstrap();
@@ -125,6 +142,9 @@ pub fn start_proxy_multi(
         server.add_service(proxy_service);
         for lb_background in lb_backgrounds {
             server.add_service(lb_background);
+        }
+        if let Some(spans) = spans {
+            server.add_service(spans);
         }
         server.run_forever();
     });
@@ -321,5 +341,101 @@ async fn serve_fake_upstream_conn(mut stream: tokio::net::TcpStream, tag: &'stat
         if stream.write_all(body).await.is_err() {
             return;
         }
+    }
+}
+
+/// A fake upstream that records the HEADER BLOCK of every request it serves,
+/// so a test can assert on what actually crossed the wire rather than on what
+/// the proxy intended to send. R893-F16 needs this: its failure mode is a
+/// header that VANISHES, which every assertion that does not look for it passes.
+pub async fn spawn_header_recording_upstream() -> (SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind recording upstream");
+    let addr = listener.local_addr().expect("local_addr");
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let sink = Arc::clone(&seen);
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            tokio::spawn(serve_recording_conn(stream, Arc::clone(&sink)));
+        }
+    });
+
+    (addr, seen)
+}
+
+async fn serve_recording_conn(
+    mut stream: tokio::net::TcpStream,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        loop {
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+            match stream.read(&mut chunk).await {
+                Ok(0) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => return,
+            }
+        }
+        let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let head: Vec<u8> = buf.drain(..header_end).collect();
+        seen.lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(&head).into_owned());
+
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        if stream.write_all(response.as_bytes()).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Collect newline-delimited JSON from a Unix socket — a stand-in for scryer's
+/// `ingestion::IngestionServer`, which this workspace cannot depend on.
+pub async fn spawn_line_collector(
+    path: std::path::PathBuf,
+) -> Arc<std::sync::Mutex<Vec<String>>> {
+    let listener = tokio::net::UnixListener::bind(&path).expect("bind collector socket");
+    let lines: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&lines);
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let sink = Arc::clone(&sink);
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut reader = tokio::io::BufReader::new(stream).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    sink.lock().unwrap().push(line);
+                }
+            });
+        }
+    });
+    lines
+}
+
+/// Poll `f` until it returns true or `within` elapses. Span export is
+/// asynchronous by construction (it must never block a request), so a test that
+/// asserts immediately after the response is asserting on a race.
+pub async fn wait_for(within: Duration, mut f: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if f() {
+            return true;
+        }
+        if std::time::Instant::now() > deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }

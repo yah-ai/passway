@@ -67,7 +67,26 @@ pub const HOP_BY_HOP: &[&str] = &[
 /// footgun regardless.) `transfer-encoding` and `te` are in [`HOP_BY_HOP`]
 /// and thus stripped by the fixed list either way; listing them here just
 /// keeps the "client can't nominate these" set explicit and complete.
-const NEVER_NOMINATE_STRIP: &[&str] = &["content-length", "transfer-encoding", "host", "te"];
+///
+/// R893-F16 — WHY `traceparent` / `tracestate` ARE ON THIS LIST. Neither is in
+/// [`HOP_BY_HOP`], so both survive an ordinary forward; W3C Trace Context
+/// §Header-Value is explicit that they are end-to-end. But nomination is
+/// honoured, so without this entry any caller sending
+/// `Connection: traceparent` gets the header carrying trace continuity removed
+/// from the request this proxy forwards — every trace through this hop severed
+/// from outside, by an unauthenticated header, with no error anywhere. It is a
+/// strictly worse failure than the framing one FIX 3 closes, because nothing
+/// downstream can tell a severed trace from a genuinely new one: the upstream
+/// mints a fresh root and the result looks like ordinary traffic. The test is
+/// [`tests::a_client_cannot_nominate_traceparent_away`].
+const NEVER_NOMINATE_STRIP: &[&str] = &[
+    "content-length",
+    "transfer-encoding",
+    "host",
+    "te",
+    "traceparent",
+    "tracestate",
+];
 
 /// `true` when `headers` describe a well-formed protocol upgrade — an
 /// `Upgrade` header naming the target protocol *and* an `upgrade` token in
@@ -237,6 +256,52 @@ mod tests {
         assert!(!h.contains_key("x-secret-internal"));
         assert!(!h.contains_key("x-other"));
         assert_eq!(h.get("x-keep").unwrap(), "kept");
+    }
+
+    // ---- R893-F16: trace context survives a hostile Connection value ----
+
+    /// The failure this ticket exists to prevent: a request that nominates
+    /// `traceparent` as hop-by-hop must still arrive upstream carrying it.
+    ///
+    /// Asserted on the header's PRESENCE AND VALUE, not on the absence of an
+    /// error, because the failure mode is a header that vanishes — it passes
+    /// every assertion that does not look for it.
+    #[test]
+    fn a_client_cannot_nominate_traceparent_away() {
+        let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let mut h = headers(&[
+            ("connection", "traceparent, tracestate, X-Other"),
+            ("traceparent", tp),
+            ("tracestate", "yah=1"),
+            ("x-other", "nominated-and-genuinely-strippable"),
+        ]);
+        strip_hop_by_hop(&mut h);
+        assert_eq!(
+            h.get("traceparent").map(|v| v.to_str().unwrap()),
+            Some(tp),
+            "traceparent must survive its own nomination — otherwise any caller \
+             can sever every trace through this hop"
+        );
+        assert_eq!(h.get("tracestate").map(|v| v.to_str().unwrap()), Some("yah=1"));
+        // The nomination mechanism itself still works for a header that is
+        // genuinely the client's to give up — this is not a blanket disable.
+        assert!(!h.contains_key("x-other"));
+        assert!(!h.contains_key("connection"));
+    }
+
+    /// Case-insensitivity: `Connection: TraceParent` is the same nomination.
+    #[test]
+    fn traceparent_nomination_is_refused_case_insensitively() {
+        let mut h = headers(&[
+            ("connection", "TraceParent"),
+            ("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        ]);
+        assert!(
+            !headers_to_strip(&h).iter().any(|n| n == "traceparent"),
+            "the nomination is lowercased before the NEVER_NOMINATE_STRIP check"
+        );
+        strip_hop_by_hop(&mut h);
+        assert!(h.contains_key("traceparent"));
     }
 
     // ---- R870-B14: upgrade offers must reach the upstream ----

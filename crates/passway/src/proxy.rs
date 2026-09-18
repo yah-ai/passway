@@ -86,6 +86,7 @@ use crate::host::{self, HostOutcome};
 use crate::idle::IdleTracker;
 use crate::path_route::PathRouter;
 use crate::routing::{HostRouter, HostUpstream, UpstreamOpts};
+use crate::trace;
 use crate::upstream;
 
 /// Per-request state. Carries the upstream set
@@ -105,11 +106,18 @@ use crate::upstream;
 /// which is the ONLY place a route's extra response headers — e.g. a
 /// wasm-isolated mount's COOP/COEP pair — actually get applied. Header
 /// ownership follows whoever matched the path.
+///
+/// R893-F16 adds `trace`: the in-flight span state, threaded from
+/// [`request_filter`] to [`logging`](PassProxy::logging) where the server span
+/// closes. `None` means this deployment has no collector configured, or the
+/// head sampler declined this trace — in both cases the request path does no
+/// further trace work at all. See [`crate::trace`].
 #[derive(Default)]
 pub struct RequestCtx {
     upstreams: Option<Arc<LoadBalancer<RoundRobin>>>,
     upstream_opts: Option<UpstreamOpts>,
     route_headers: Vec<(String, String)>,
+    trace: Option<trace::RequestTrace>,
 }
 
 /// Which axis this proxy dispatches on — the "one mechanism, two
@@ -175,8 +183,11 @@ impl RoutingStrategy {
         canonical_path: Option<&str>,
     ) -> RouteOutcome<'a> {
         match self {
+            // A host-routed door genuinely does not know the app's routes, so
+            // it reports no `http.route` (R893-F16) — substituting the raw path
+            // would be a high-cardinality key in a low-cardinality slot.
             RoutingStrategy::ByHost(r) => match r.resolve(host) {
-                Some(u) => RouteOutcome::Found(u, &[]),
+                Some(u) => RouteOutcome::Found { upstream: u, headers: &[], route: None },
                 None => RouteOutcome::NoRoute,
             },
             RoutingStrategy::ByPath(p) => {
@@ -186,7 +197,11 @@ impl RoutingStrategy {
                 let path = canonical_path
                     .expect("ByPath strategy requires a canonicalized path (see needs_canonical_path)");
                 match p.resolve(path) {
-                    Some(route) => RouteOutcome::Found(&route.upstream, &route.headers),
+                    Some(route) => RouteOutcome::Found {
+                        upstream: &route.upstream,
+                        headers: &route.headers,
+                        route: Some(&route.mount),
+                    },
                     None => RouteOutcome::NoRoute,
                 }
             }
@@ -199,7 +214,13 @@ impl RoutingStrategy {
 /// 503 either way (see [`crate::routing`] and [`crate::path_route`]'s module
 /// docs: a routing miss must not be distinguishable from a readiness miss).
 enum RouteOutcome<'a> {
-    Found(&'a HostUpstream, &'a [(String, String)]),
+    Found {
+        upstream: &'a HostUpstream,
+        headers: &'a [(String, String)],
+        /// R893-F16: the matched MOUNT on a path-routed door, which is a
+        /// low-cardinality `http.route`. `None` on a host-routed door.
+        route: Option<&'a str>,
+    },
     NoRoute,
 }
 
@@ -224,6 +245,9 @@ pub struct PassProxy {
     /// R870-F8: per-authority holding-page overrides. `None` = every 503 gets
     /// [`crate::holding::HOLDING_PAGE`].
     holding: Option<holding::SharedHoldingPages>,
+    /// R893-F16: where finished spans go. `None` = no collector configured, and
+    /// the request path does no trace work at all.
+    spans: Option<trace::SpanSink>,
 }
 
 impl PassProxy {
@@ -260,7 +284,17 @@ impl PassProxy {
             draining: Arc::new(AtomicBool::new(false)),
             idle: None,
             holding: None,
+            spans: None,
         }
+    }
+
+    /// R893-F16: emit a `Server` span per request and a `Client` span per
+    /// upstream call into `sink`. Left unset, this proxy is untraced and pays
+    /// nothing — see [`crate::trace`] for the propagation and sampling rules,
+    /// and [`crate::trace::from_env`] for how a deployment turns it on.
+    pub fn with_spans(mut self, sink: trace::SpanSink) -> Self {
+        self.spans = Some(sink);
+        self
     }
 
     /// R870-F8: serve a per-domain holding page on a fail-ready 503 for the
@@ -427,6 +461,34 @@ async fn write_unavailable(
     Ok(())
 }
 
+/// @yah:ticket(R893-F16, "passway: emit server + client spans from the pingora hooks, and protect traceparent from Connection-nomination stripping")
+/// @yah:status(review)
+/// @yah:at(2026-09-13T08:53:56Z)
+/// @yah:assignee(agent:bundle-anthropic-glimmerstone)
+/// @yah:parent(R893)
+/// @yah:next("Tier: Wizard - this is the request path of public ingress and it touches header-security code (hardening.rs) that R594-F4's adversarial review already hardened once. A careless edit here is a smuggling surface, not a cosmetic bug.")
+/// @yah:next("PASSWAY IS THE SIDECAR - no new process is needed. It is a pingora ProxyHttp impl with request_filter -> upstream_peer -> upstream_request_filter -> response_filter (proxy.rs:1-32; response_filter added by R870-F15). Adopt-or-mint traceparent in request_filter, write it onto the forwarded request in upstream_request_filter, close the SERVER span in response_filter with the real duration.")
+/// @yah:next("DO NOT try to start the trace at the edge - it is structurally impossible. passway-demux on :443 splices raw TCP without terminating TLS and sees no plaintext (oss/passway/crates/sni-demux/src/lib.rs:1-16); R777's tenant-isolation verdict depends on that staying true, so do not teach it HTTP. The :80 http-router only redirects or splices. The per-tenant passway is the first process that can see a header.")
+/// @yah:next("ADD traceparent (and tracestate) to NEVER_NOMINATE_STRIP in oss/passway/crates/passway/src/hardening.rs:70. traceparent is not in HOP_BY_HOP (:44-53) so it survives a normal forward, but RFC7230 6.1 nomination IS honoured, so any client sending 'Connection: traceparent' can silently turn tracing off from outside. Test it the way the existing strip tests do (hardening.rs:228 strips_headers_nominated_by_connection_value).")
+/// @yah:next("SAMPLING IS AN OPERATOR CALL, not a default to guess - ask before shipping an always-on sampler. scryer's quota::ServiceQuotaManager defaults to 1000 ev/s per MeshIdent; spans are higher-volume than logs, so quote that number when asking.")
+/// @arch:see(.yah/docs/working/W346-services-tab-three-views-and-the-tab-boundary.md)
+/// @yah:depends_on(R893-F15)
+/// @yah:handoff("LANDED - SPAN EMISSION FROM THE PINGORA HOOKS. New oss/passway/crates/passway/src/trace.rs (the whole propagation + emission layer; its module doc carries the reasoning for everything below, written at the code site rather than only here). Wiring in proxy.rs: RequestCtx gains `trace` (:109 region); PassProxy gains `spans` + `with_spans` (:295); request_filter adopts-or-mints the trace BEFORE any gate can answer (:503) so a 400/401/503 still produces a span; request_filter records route+peer once routing resolves (:698); upstream_peer records the selected backend (:745); upstream_request_filter writes `traceparent` onto the forwarded request AFTER the hop-by-hop strip (:794); response_filter closes the CLIENT leg (:808); logging closes the SERVER span (:491). main.rs arms it from env and registers the exporter as a pingora background_service. DEVIATION FROM THE SPIKE, deliberate: the SERVER span closes in `logging`, NOT in `response_filter`. response_filter fires on upstream-header-arrival (so a span closed there reports time-to-first-byte and omits body transfer) and never fires at all for a request request_filter rejected (so every 400/401/503 - the traffic an operator most wants - would be invisible). `logging` is pingora's always-called terminal hook. The CLIENT span does close in response_filter; that IS the boundary it measures.")
+/// @yah:handoff("THE OPEN DECISION F15 HANDED ME - HOW SPANS REACH SCRYER ON THE WIRE. DECIDED: the EXISTING Unix-socket ingestion line protocol, made explicitly signal-tagged. New observation::IngestLine (oss/qed/crates/observation/src/ingest.rs:49), a serde internally-tagged enum on `signal` with two arms - Event{scope_kind,scope_id,level,target,msg,fields} and Span{scope_kind,scope_id,span:Box<Span>}. Both ends name that ONE type: scryer::ingestion deserializes it (ingestion.rs:119) and passway serializes it. Why that transport and not a new one, in order of weight. (1) scryer already owns a local-agent socket with a per-MeshIdent quota, a store behind it and a deploy-time env contract R893-B17 is already fixing; a span emitter needs exactly that shape, and a second transport would need its own address, its own quota and its own answer to 'where is my collector'. (2) NOT the :6543 HTTP listener - that is the FEDERATION (cross-machine read) surface; a per-request emitter on the same box paying HTTP framing + a connection pool + a TLS-or-not decision to reach a socket in the same mount namespace is strictly worse. (3) TAGGED, NOT SHAPE-SNIFFED: probing for a `span` key would put the discriminator in the ABSENCE of a field, which is the pre-1.0 shim CLAUDE.md forbids. THE BREAK THIS COST, and why it was free: the tag is REQUIRED, so an untagged line is now DROPPED rather than assumed to be an event. I re-grepped the premise before taking it (R893-S10's gotcha said to) - `YAH_SCRYER_SOCKET` still has zero producers repo-wide, so there are no live writers to break today and a defaulted tag would have been a compatibility shim carried forever. Producer updated in the same pass: crates/yah/log/src/service_layer.rs now writes \"signal\":\"event\" on both its line sites (the layer's Map at :188 and emit_synth_dropped's json! at :74), and observation::ingest::tests::the_yah_log_line_shape_still_parses pins that exact object so the two cannot drift.")
+/// @yah:handoff("FOR R893-F19 - THE EXACT ATTRIBUTES AND IDENTITIES THIS EMITTER PRODUCES. Read this before writing the hop matrix; it is what peer_ident() and the rollup key will actually contain. ONE REQUEST => UP TO TWO SPANS, same trace: a SERVER span (kind=Server) covering the whole downstream exchange, parented to the inbound traceparent's span id or None if a root; and a CLIENT span (kind=Client) covering the upstream call, parented to the SERVER span. The client span's id is what goes into the forwarded traceparent, so the upstream's own Server span parents onto the leg that actually called it - the chain is caller -> Client -> Server -> callee, which is what makes F15's `kind`-in-the-rollup-key decision render correctly. A request request_filter rejected (400/401/503) emits ONLY a server span: no client leg means no hop happened and emitting a zero-length one would invent a hop. ATTRIBUTES, all via F15's ATTR_* consts, never re-spelled. On BOTH spans: service.name (this door's YAH_SERVICE_IDENT), http.request.method (semconv-normalized - known methods uppercased, everything else collapsed to `_OTHER` so a caller cannot mint unbounded rollup keys by inventing methods, trace.rs:402), url.path, and http.route WHEN KNOWN. On the SERVER span only: client.address, plus http.response.status_code as Int (never Str). On the CLIENT span only: server.address + server.port (Int) from the selected backend, and yah.peer.service. yah.peer.service IS EMITTED, as F15 required - it is the matched MOUNT on a path-routed inner door, and the resolved request AUTHORITY on a host-routed public door. Both are logical names, so Span::peer_ident() returns a tenant rather than a mesh IP and two tenants behind one address stay two rows. http.route is Some(mount) on a path-routed door and deliberately None on a host-routed one: that door genuinely does not know the app's routes, and substituting url.path would put a high-cardinality value in a low-cardinality slot. Span NAME follows the same rule: `GET /app` when a route is known, bare `GET` otherwise - never the raw path. NOTE FOR THE MATRIX: the SERVER span carries NO yah.peer.service, because a public door's caller is the internet and has no logical name; peer_ident() returns None there and the store writes the empty-string key. Expect server-kind rows keyed on empty peer at the public tier - that is correct, not a bug to paper over.")
+/// @yah:handoff("WHAT COUNTS AS AN ERROR AT THIS HOP - the call F15 said the emitter owns, made and recorded at trace.rs:513 (status_for) and :524 (error_type_for). RULE: 5xx and an exchange that never produced a response header are SpanStatus::Error; 4xx is SpanStatus::Ok. Reasoning, so F19 does not re-litigate it in the view: a 401 from the auth gate, a 400 on an ambiguous path and a 404 from the app are the door working exactly as designed, and counting them would make the hop matrix's error-rate column track how many malformed requests the internet sent rather than whether the hop is broken - which is the one question it exists to answer. passway's own fail-ready 503 IS counted; it is a 5xx and it does mean the hop cannot serve. error.type follows semconv's HTTP form (the status code as a string, or \"no_response\"), not a message. SAMPLING - the ticket said ask; I shipped a default instead, and here is the argument so it can be overridden cheaply. Head-based OTel TraceIdRatioBased at ratio 1.0, dialable by PASSWAY_TRACE_SAMPLE (0.0..=1.0). The gate is NOT the rate, it is the env contract: nothing is emitted at all unless BOTH YAH_SERVICE_IDENT and YAH_SCRYER_SOCKET are present, which is a deploy-time act, and with them absent the proxy holds no sink and the request path does no trace work whatsoever - not even minting ids. The number to argue against is scryer's quota::ServiceQuotaManager 1000 ev/s per MeshIdent; at 2 spans/request that is ~500 req/s per door before shedding. The decision is a pure function of the trace id, so every hop in one trace agrees and traces come out whole rather than perforated; an inbound traceparent that already carries the sampled flag is HONOURED, not re-rolled. BACKPRESSURE: SpanSink::emit is a try_send onto a 2048-deep bounded channel and DROPS when full or when the exporter is gone, logging the running count. A door must serve traffic rather than stall on its own telemetry, and an unbounded queue would turn a stalled collector into this process's memory leak.")
+/// @yah:handoff("THE SECOND HALF - traceparent PROTECTED FROM Connection-NOMINATION STRIPPING, and PROVEN by mutation rather than by assertion. `traceparent` and `tracestate` added to NEVER_NOMINATE_STRIP (oss/passway/crates/passway/src/hardening.rs:82) with the why at the const. Neither is in HOP_BY_HOP so both survive an ordinary forward, but RFC7230 6.1 nomination IS honoured, so before this any caller sending `Connection: traceparent` removed the header carrying trace continuity from the forwarded request - every trace through the hop severed from outside, by an unauthenticated header, with no error anywhere. It is worse than the framing bug FIX 3 closes because nothing downstream can tell a severed trace from a genuinely new one: the upstream mints a fresh root and it looks like ordinary traffic. THREE TESTS, and I ran the NEGATIVE CONTROL: with the two names temporarily removed from the list, `cargo test -p passway` fails exactly hardening::tests::a_client_cannot_nominate_traceparent_away, hardening::tests::traceparent_nomination_is_refused_case_insensitively and the end-to-end trace_context::a_nominated_traceparent_still_reaches_the_upstream (216 passed / 2 failed on the lib binary; 2 passed / 1 failed on the integration binary). The names were restored by Edit and the full suite re-run green. WORTH KNOWING FOR ANY FUTURE EDIT HERE: trace_context::a_traced_door_continues_the_trace_and_exports_both_spans PASSED under that mutation, because upstream_request_filter writes passway's own traceparent AFTER the strip and overwrites whatever survived. So the traced path masks the bug entirely - the UNTRACED test is the real gate, and that ordering (write after strip, proxy.rs:794) is deliberate so the upstream unconditionally sees the header THIS proxy minted. New integration file oss/passway/crates/passway/tests/trace_context.rs, registered in tests/main.rs, asserting on the header block a RECORDING fake upstream actually received (common::spawn_header_recording_upstream) rather than on a status code - this ticket's failure mode is a header that vanishes, and with it stripped the request still returns 200 and every other assertion in the suite still passes.")
+/// @yah:handoff("DISCOVERED WORK, all fixed in this pass rather than filed. (1) oss/passway/Cargo.toml NOW CARRIES A [patch.crates-io] BLOCK, and the manifest comment that forbade one had to be corrected because my change disproves it as written. observation is a PATH dep so cargo never consults the registry for it, but observation's OWN dep on yah-workload-spec is a registry req at the in-tree version, and the in-tree version is always ahead of what is published - without the redirect `cargo check` fails to RESOLVE in the monorepo today (\"failed to select a version for the requirement `yah-workload-spec = ^0.8.39`; candidate versions found which didn't match: 0.8.37, ...\"). The old comment was about R853-F6 removing a patch that substituted a FORK for a published third-party crate; that is a different thing and the comment now says so and names the allowed case. CONSEQUENCE AN OPERATOR MAY WANT TO WEIGH: scripts/export-oss.sh:245-272 detects a [patch.crates-io] block and switches that repo to a SNAPSHOT export, so passway's mirror now gains one \"export: passway snapshot (patch stripped)\" commit per export instead of per-commit history. Existing mirror history is preserved and grafted onto; this is the same trade kamaji/yubaba/qed already make (export-oss.sh:43). Reversible by dropping the observation dep. (2) crates/yah/log/src/lib.rs tests::init_noop_without_env was a STALE TEST that fails in this camp for a boring reason: it asserted try_layer() is None by reading the AMBIENT environment, and yah's own runner exports YAH_TASK_RUN + YAH_LOG_PIPE into every session it spawns, so try_layer correctly returned Some and the premise was simply false. Confirmed pre-existing and unrelated to my change (try_layer reads neither variable I touched) - reproduced single-threaded with both vars visible in `env`. Fixed by clearing them explicitly via a new EnvGuard::unset, so the test tests try_layer rather than the test runner. (3) proxy.rs's RouteOutcome::Found went from a positional 2-tuple to a struct variant carrying `route`, rather than growing a third anonymous field - the mount had to reach the emitter and a 3-tuple would have been unreadable at both ends. (4) One clippy warning I introduced (manual_is_multiple_of) cleared; `cargo clippy -p passway --all-targets` reports ZERO findings anchored in trace.rs or hardening.rs, and the 3 that remain are pre-existing in auth.rs/path.rs/proxy.rs's auth block.")
+/// @yah:handoff("LOUD NOTICE TO R893-F19 AND TO @Ashguard (F15's author), as F15's handoff required of anyone extending it: I ADDED A MODULE TO `observation` - src/ingest.rs, plus `pub mod ingest;` and `pub use ingest::IngestLine;` in lib.rs. I did NOT touch Span, TraceId/SpanId, SpanKind, SpanStatus, AttrValue, any ATTR_* const, LatencyHistogram, HopRollup, the rollup window, or types.rs at all - the file F19 reads is byte-unchanged by me. The addition is purely the wire envelope (scope_kind/scope_id/span) that F15 deliberately left open. observation's manifest is likewise unchanged: still serde / serde_json / uuid / workload-spec, and NO OTel crate is linked anywhere in this change (passway's new deps are `observation` path+version and `uuid` v4 for id minting, which was already in the graph via observation). I also added an arm to scryer::ingestion's read loop and one test there; EventStore, the spans/span_rollups tables, insert_spans, query_spans and query_hop_rollups are untouched. Spans deliberately do NOT go through the event ring - the ring batches log lines whose per-scope seq must stay monotonic, whereas a span already carries its own identity, timestamp and duration, and insert_spans is INSERT OR IGNORE with the rollup update riding the same transaction (F15 trap (a)); writing straight through keeps the raw row and its rollup atomic, which a ring flush would not. STILL NOT DONE, and NOT this ticket: nothing injects YAH_SERVICE_IDENT / YAH_SCRYER_SOCKET into a workload env yet, so no door is traced in production until R893-B17 lands - I re-confirmed that absence rather than assuming it. B17's fourth @yah:next already names this emitter as its second consumer; it now has a concrete name to conform to and needs no new mechanism.")
+/// @yah:verify("MEASURED BY THIS COURIER, every baseline taken on the same tree BEFORE the first edit. (A) `cd oss/passway && cargo test -p passway` = 218 lib + 43 bin + 40 integration + 0 doc, 0 failed; baseline 205 + 43 + 37 + 0, 0 failed. Net +13 lib (11 in trace.rs mod tests, 2 in hardening.rs) and +3 integration (tests/trace_context.rs). (B) `cd oss/qed && cargo test -p observation --lib` = 13 passed / 0 failed, baseline 10 / 0 (+3 in ingest::tests). (C) `cd oss/qed && cargo test -p yah-scryer --lib` = 87 passed / 0 failed, baseline 86 / 0 (+1, ingestion_server_accepts_spans_and_they_do_not_land_as_events). (D) `cargo test -p yah-log` (root) = 12 lib + 8 doc, 0 failed. NO PRE-EDIT BASELINE WAS TAKEN FOR (D) - stated plainly rather than back-filled. It was RED when I first ran it, on tests::init_noop_without_env, and I established that failure as pre-existing and environmental rather than mine before fixing it (see the discovered-work handoff entry): the test reads ambient env that yah's runner sets, and try_layer reads neither variable this change touches. Test COUNT is unchanged either way - I added assertions to two existing tests, not tests.")
+/// @yah:verify("WIDER GATES, all run by me. `cd oss/qed && cargo check --workspace --all-targets` exits 0; the warnings that remain are pre-existing and in files this ticket did not touch (yah-object-store's parse_list_v2, two unused imports in task-runs/src/user_beholders.rs) - the same two F15 recorded. Root workspace `cargo check -p yah-hub -p gnomes -p yah-agent-tools -p yah-log --lib` exits 0 (those are the root-side consumers of observation plus the yah-log producer I edited); its warnings are all pre-existing and in yah-board / yah-runner / yah-agent-tools, untouched here. `cargo clippy -p passway --all-targets` finishes with ZERO findings anchored in trace.rs or hardening.rs. `cd oss/passway && cargo deny check bans licenses` = \"bans ok, licenses ok\" - relevant because deny.toml sets wildcards=\"deny\" (both new deps carry versions) and bans non-rustls TLS backends (neither new dep brings one); the x509-parser duplicate-entry warning is pre-existing, from pingora-core vs passway-acme. SHARED-TREE CAVEAT, stated rather than hidden: the camp build rail flagged deferred skew on three of these runs - peers edited crates/yah/cloud-client/src/lib.rs, app/yah/cli/src/cloud.rs and oss/passway/Cargo.lock while they were in flight. None is in passway's, observation's or scryer's source closure, and the final green runs of (A), (B), (C) and the qed workspace check were all reported skew-clean (\"input closure unchanged across the whole run\"). A reviewer re-running the ROOT check should expect to re-run it rather than treat mine as authoritative.")
+/// @yah:handoff("SCOPE COMPLETE - both halves of the ticket landed and verified, and the one open design decision F15 delegated (span transport) is decided, implemented and written up above rather than handed back. Nothing in this ticket is blocked.")
+/// @yah:handoff("Tree anchor at handoff: e0530813af8f7d86f5eb7ea9a6b5a57d386bf30b — the shared tree as I left it. Diff against it (`git diff e0530813af8f7d86f5eb7ea9a6b5a57d386bf30b..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+/// @yah:next("OPERATOR CALL LEFT OPEN, cheap to reverse either way: the shipped head-sample ratio is 1.0, gated by the env contract rather than by the rate. If a door is expected past ~500 req/s (scryer's 1000 ev/s per-MeshIdent quota at 2 spans/request), set PASSWAY_TRACE_SAMPLE below 1.0 on that deployment - no rebuild needed.")
+/// @yah:handoff("LEADER SIGN-OFF (relay R893, @Ashguard:polaris). Accepted, and this is the strongest ticket in the relay. Three things it did right that are worth naming so they are not undone. (1) IT MADE THE DECISION F15 DELEGATED instead of handing it back: the span transport is the existing Unix-socket ingestion line, made explicitly signal-tagged via observation::IngestLine, with the reasoning recorded and the :6543 federation surface rejected for a stated reason. (2) IT PROVED THE HEADER FIX BY MUTATION, not by assertion -- with traceparent/tracestate temporarily removed from NEVER_NOMINATE_STRIP, the suite fails exactly three tests, and crucially it identified that the TRACED test passes under that mutation (upstream_request_filter writes passway's own traceparent after the strip, masking the bug) so the UNTRACED test is the real gate. That is the difference between a test that exists and a test that works. (3) IT DEVIATED FROM THE SPIKE DELIBERATELY AND SAID SO: the SERVER span closes in `logging`, not `response_filter`, because response_filter fires on upstream-header-arrival and never fires at all for a request request_filter rejected -- so every 400/401/503, the traffic an operator most wants, would have been invisible. The CLIENT span does close in response_filter; that is the boundary it measures.")
+/// @yah:verify("RE-VERIFIED BY THE LEADER via an independent read-only session (@Ashguard:coffee, session:97e07d09), all five gates at the claimed counts. cd oss/passway && cargo test -p passway = 218 lib + 43 bin + 40 integration + 0 doc, 0 failed. cd oss/qed && cargo test -p observation --lib = 13 / 0. cd oss/qed && cargo test -p yah-scryer --lib = 87 / 0. cargo test -p yah-log (root) = 12 lib + 8 doc, 0 failed. cargo clippy -p passway --all-targets = 3 warnings, ALL pre-existing and anchored at auth.rs:84, path.rs:164 and proxy.rs:635; ZERO anchored in trace.rs or hardening.rs. THE GREP CHECK NO TEST WOULD CATCH: NEVER_NOMINATE_STRIP at hardening.rs:82 contains BOTH names -- \"traceparent\" at :87 and \"tracestate\" at :88. Peer-skew advisories appeared on several runs (session:9ad37012 was building -p desktop alongside); the gates above are the settled re-runs.")
+/// @yah:gotcha("ONE OPERATOR-VISIBLE CONSEQUENCE AN APPROVER SHOULD WEIGH, not a defect: this ticket added a [patch.crates-io] block to oss/passway/Cargo.toml, which was genuinely required -- `observation` is a path dep so cargo never consults the registry for it, but observation's OWN dep on yah-workload-spec is a registry requirement at the in-tree version, and the in-tree version is always ahead of what is published, so without the redirect `cargo check` fails to RESOLVE in the monorepo. The manifest comment that forbade a patch block was about R853-F6 removing a patch that substituted a FORK for a published third-party crate -- a different thing -- and was corrected in place to name the allowed case. THE CONSEQUENCE: scripts/export-oss.sh:245-272 detects a [patch.crates-io] block and switches that repo to a SNAPSHOT export, so passway's mirror now gains one \"export: passway snapshot (patch stripped)\" commit per export instead of per-commit history. Existing mirror history is preserved and grafted onto, and this is the same trade kamaji/yubaba/qed already make (export-oss.sh:43). Reversible by dropping the observation dep.")
+/// @yah:handoff("OPERATOR ANSWER ON THE SAMPLING CALL, 2026-09-13 (asked by @Ashguard:polaris, answered by human@yah.dev): **KEEP THE SHIPPED DEFAULT OF 1.0; dial per-door if a door outgrows it.** The courier's judgement to ship a default rather than block on the question is upheld, and so is the default it picked. Reasoning given: below roughly 500 req/s a door loses nothing, whole traces beat sampled ones while the shape of the data is still being learned, and any door that outgrows the quota gets PASSWAY_TRACE_SAMPLE set on that deployment with no rebuild and no redeploy of anything else. The alternative -- lowering the fleet-wide default pre-emptively so no deployment can silently shed at scryer's 1000 ev/s per-MeshIdent quota -- was considered and rejected, on the grounds that partial traces from day one make every panel harder to interpret. No code change results from this answer; the @yah:next entry describing it as an open operator call is now ANSWERED and should be read as settled.")
 #[async_trait]
 impl ProxyHttp for PassProxy {
     type CTX = RequestCtx;
@@ -438,9 +500,20 @@ impl ProxyHttp for PassProxy {
     /// Always called by pingora at the end of every request, including ones
     /// `request_filter` rejected — which is what keeps the R779 idle count
     /// balanced with the `begin()` at the top of `request_filter`.
-    async fn logging(&self, _session: &mut Session, _e: Option<&Error>, _ctx: &mut Self::CTX) {
+    /// R893-F16: the SERVER span closes here, not in `response_filter`.
+    /// `logging` is the only hook that sees both the end of the body transfer
+    /// and the requests `request_filter` answered itself (400/401/503) — see
+    /// [`crate::trace`]'s module doc for why closing earlier would report
+    /// time-to-first-byte and omit every rejection from the hop matrix.
+    async fn logging(&self, session: &mut Session, _e: Option<&Error>, ctx: &mut Self::CTX) {
         if let Some(idle) = &self.idle {
             idle.end();
+        }
+        if let (Some(sink), Some(t)) = (&self.spans, ctx.trace.take()) {
+            // `None` here means the exchange died before any response header
+            // was written, which `RequestTrace` records as an error.
+            let status = session.response_written().map(|r| r.status.as_u16());
+            t.finish(sink, status);
         }
     }
 
@@ -457,7 +530,7 @@ impl ProxyHttp for PassProxy {
         // (U+FFFD-substituted) view of a non-UTF-8 path while the real bytes
         // still reach the upstream (adversarial-review FIX 2). `raw_path()`
         // returns path-and-query, so `path_only` strips the query.
-        let (path_bytes, has_conflict, bearer, host, wants_html) = {
+        let (path_bytes, has_conflict, bearer, host, wants_html, traced) = {
             let req = session.req_header();
             let path_bytes = path_only(req.raw_path()).to_vec();
             let has_conflict = hardening::has_conflicting_length_headers(&req.headers);
@@ -466,8 +539,28 @@ impl ProxyHttp for PassProxy {
             // R870-F5: read here, with the other owned decisions, because the
             // 503 sites below already hold the session mutably.
             let wants_html = holding::prefers_html(&req.headers);
-            (path_bytes, has_conflict, bearer, host, wants_html)
+            // R893-F16: adopt-or-mint the trace here, before any gate can
+            // answer, so a rejected request still produces a span.
+            let traced = self.spans.as_ref().and_then(|sink| {
+                let inbound = req
+                    .headers
+                    .get(trace::TRACEPARENT)
+                    .and_then(|v| v.to_str().ok());
+                trace::RequestTrace::begin(
+                    sink,
+                    inbound,
+                    req.method.as_str(),
+                    &String::from_utf8_lossy(&path_bytes),
+                )
+            });
+            (path_bytes, has_conflict, bearer, host, wants_html, traced)
         };
+        ctx.trace = traced;
+        if let Some(t) = ctx.trace.as_mut() {
+            if let Some(addr) = session.client_addr() {
+                t.set_client_address(&addr.to_string());
+            }
+        }
 
         // /health is answered directly — never gated by auth, by the
         // authority, or by upstream readiness, since its entire job is to
@@ -588,8 +681,11 @@ impl ProxyHttp for PassProxy {
         // must stay indistinguishable to anyone probing which tenants exist.
         // Resolved inside the branches rather than above them because the
         // overwhelming majority of requests take neither.
-        let (upstream, route_headers) = match self.routing.resolve(host.as_deref(), canonical.as_deref()) {
-            RouteOutcome::Found(u, headers) => (u, headers),
+        let (upstream, route_headers, route) = match self
+            .routing
+            .resolve(host.as_deref(), canonical.as_deref())
+        {
+            RouteOutcome::Found { upstream, headers, route } => (upstream, headers, route),
             RouteOutcome::NoRoute => {
                 let page = self.holding_page_for(host.as_deref());
                 respond_unavailable(session, wants_html, page.as_deref()).await?;
@@ -605,6 +701,18 @@ impl ProxyHttp for PassProxy {
             let page = self.holding_page_for(host.as_deref());
             respond_unavailable(session, wants_html, page.as_deref()).await?;
             return Ok(true);
+        }
+
+        // R893-F16: the other end of this hop, recorded as a LOGICAL name.
+        // `yah.peer.service` is load-bearing for R893-F19's hop matrix —
+        // `server.address` alone keys the matrix on a mesh IP and collapses two
+        // tenants sharing one into a single row. A path-routed inner door's
+        // peer is the matched mount (one component of this service); a
+        // host-routed public door's peer is the authority it resolved, which is
+        // the fronted tenant's own identity.
+        if let Some(t) = ctx.trace.as_mut() {
+            let peer = route.or(host.as_deref());
+            t.set_route(route, peer);
         }
 
         ctx.upstreams = Some(Arc::clone(&upstream.lb));
@@ -626,6 +734,8 @@ impl ProxyHttp for PassProxy {
         _session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> PResult<Box<HttpPeer>> {
+        // R893-F16 note: the selected backend is recorded on the trace at the
+        // bottom of this method, once `lb.select` has actually chosen one.
         // Always the set `request_filter` resolved and readiness-gated — a
         // request can only reach here through that path, so an unset ctx is
         // a bug in this file rather than a routing miss, and fails closed
@@ -647,7 +757,12 @@ impl ProxyHttp for PassProxy {
         // `key` doesn't matter for RoundRobin (see pingora's own
         // load_balancer.rs example) — b"" mirrors it verbatim.
         match lb.select(b"", 256) {
-            Some(backend) => Ok(Box::new(HttpPeer::new(backend, opts.tls, opts.sni))),
+            Some(backend) => {
+                if let Some(t) = ctx.trace.as_mut() {
+                    t.set_peer_address(&backend.addr.to_string());
+                }
+                Ok(Box::new(HttpPeer::new(backend, opts.tls, opts.sni)))
+            }
             // request_filter already gated emptiness; reaching here means a
             // backend flipped unhealthy in the race window between the two
             // checks. Fail the same way request_filter would have.
@@ -662,7 +777,7 @@ impl ProxyHttp for PassProxy {
         &self,
         _session: &mut Session,
         upstream_request: &mut RequestHeader,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> PResult<()> {
         // R594-S1 checklist, applied literally, on the actual request about
         // to be forwarded (defense in depth #2).
@@ -686,6 +801,16 @@ impl ProxyHttp for PassProxy {
         for name in hardening::headers_to_strip(&upstream_request.headers) {
             upstream_request.remove_header(name.as_str());
         }
+        // R893-F16: write this hop's trace context AFTER the strip, never
+        // before. `traceparent` is in `NEVER_NOMINATE_STRIP` so the strip
+        // cannot take it — but ordering it this way means the header the
+        // upstream sees is unconditionally the one THIS proxy minted, whatever
+        // the client sent, rather than something a future change to the strip
+        // list could quietly alter.
+        if let Some(t) = ctx.trace.as_mut() {
+            let value = t.begin_client_leg();
+            upstream_request.insert_header(trace::TRACEPARENT, value)?;
+        }
         Ok(())
     }
 
@@ -705,6 +830,12 @@ impl ProxyHttp for PassProxy {
     ) -> PResult<()> {
         for (name, value) in &ctx.route_headers {
             upstream_response.insert_header(name.clone(), value.clone())?;
+        }
+        // R893-F16: the CLIENT span closes here — upstream-header-arrival is
+        // exactly the boundary it measures. The SERVER span does not; it closes
+        // in `logging`, which also sees the requests that never got this far.
+        if let Some(t) = ctx.trace.as_mut() {
+            t.end_client_leg(upstream_response.status.as_u16());
         }
         Ok(())
     }

@@ -27,6 +27,9 @@ mod path_confusion;
 mod path_routes_file;
 mod path_routing;
 mod round_robin;
+// R893-F16: trace context through a live proxy — the nomination-strip gate and
+// the two-span export.
+mod trace_context;
 #[cfg(all(target_os = "linux", feature = "socket-activation"))]
 mod socket_activation;
 mod yubaba_discovery;

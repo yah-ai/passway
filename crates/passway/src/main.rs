@@ -43,6 +43,9 @@
 //! | `PASSWAY_UPSTREAM_SNI` | SNI to present when upstream TLS is on. Bare string (process-wide) or the same `<hostname>=` fan-in form | empty |
 //! | `PASSWAY_HOLDING_DIR` | R870-F8: DIRECTORY holding this door's per-domain holding-page overrides — a `hosts` map plus `pages/<name>.html` bodies, written by `yubaba::demux_routes` from the enrollment set. An authority with no entry (and any door with this unset) gets passway's own [`passway::holding::HOLDING_PAGE`] | unset (no overrides) |
 //! | `PASSWAY_HOLDING_RELOAD_SECS` | how often that directory is re-read, so a page can change under a running door | `30` |
+//! | `YAH_SERVICE_IDENT` | R893-F16: this door's mesh ident. Set together with `YAH_SCRYER_SOCKET` it arms span emission — the door reports it as `service.name` and scopes its spans to it. The same pair `yah-log` reads, deliberately: one deploy-time contract for both signals (R893-B17) | unset (untraced) |
+//! | `YAH_SCRYER_SOCKET` | R893-F16: path to the local scryer ingestion socket finished spans are written to, as `observation::IngestLine`. See [`passway::trace`] | unset (untraced) |
+//! | `PASSWAY_TRACE_SAMPLE` | R893-F16: head sample ratio in `0.0..=1.0`, trace-id-based so every hop in one trace decides alike. An inbound `traceparent` that is already sampled is honoured rather than re-rolled | `1.0` |
 //! | `PASSWAY_HEALTH_PATH` | `/health`-equivalent path | `/health` |
 //! | `PASSWAY_HEALTH_CHECK_INTERVAL_SECS` | TCP health-check cadence | `5` |
 //! | `PASSWAY_UPDATE_INTERVAL_SECS` | upstream-source re-poll cadence | `30` |
@@ -1484,6 +1487,22 @@ fn main() {
         log::info!("passway idle self-reap armed: exit after {}s with no requests in flight", ttl.as_secs());
     }
 
+    // R893-F16: span emission. Armed only when this workload was deployed with
+    // a local collector — the SAME `YAH_SERVICE_IDENT` + `YAH_SCRYER_SOCKET`
+    // pair `yah-log` reads, so the deploy-time "where is my collector" contract
+    // is fixed once (R893-B17) rather than once per signal. Unset = the proxy
+    // holds no sink and the request path does no trace work at all.
+    let mut span_exporter = None;
+    if let Some((sink, service)) = passway::trace::from_env() {
+        log::info!(
+            "passway tracing armed: service.name={} -> {}",
+            sink.service_ident(),
+            service.socket_path()
+        );
+        proxy = proxy.with_spans(sink);
+        span_exporter = Some(background_service("passway span exporter", service));
+    }
+
     let mut proxy_service = pingora::proxy::http_proxy_service(&server.configuration, proxy);
     if plaintext_listener {
         // R870-F23: the loopback inner door. No handshake, so no ALPN offer
@@ -1506,6 +1525,9 @@ fn main() {
     }
     if let Some(watcher) = holding_watcher {
         server.add_service(watcher);
+    }
+    if let Some(exporter) = span_exporter {
+        server.add_service(exporter);
     }
     if let Some(bind) = redirect_bind {
         let redirect_service =

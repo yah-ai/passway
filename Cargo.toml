@@ -32,13 +32,65 @@ resolver = "2"
 # `[patch.crates-io]`'s non-propagation to published crates turned out to cost
 # more than the fork was worth. See crates/passway/src/socket_activation.rs.
 #
-# Do NOT reintroduce a [patch.crates-io] block here without reading that: it
-# does not propagate to consumers, so it silently breaks `cargo install passway`
-# for everyone on crates.io while working fine in this monorepo.
-
+# Do NOT reintroduce a [patch.crates-io] block here to redirect a THIRD-PARTY
+# crate (that is what R853-F6 removed): such a patch does not propagate to
+# consumers, so it silently breaks `cargo install passway` for everyone on
+# crates.io while working fine in this monorepo.
+#
+# R893-F16, 2026-09-13 — THE ONE BLOCK THAT IS ALLOWED, and why it is not the
+# thing above. `crates/passway` now depends on `observation` (oss/qed) for the
+# OTel span model it emits. That is a path dependency, so cargo never consults
+# the registry for it — but observation's OWN dependency on `yah-workload-spec`
+# is a registry req at the in-tree version, and the in-tree version is always
+# ahead of what is published. Without the redirect below, `cargo check` in this
+# workspace fails to RESOLVE, in the monorepo, today:
+#
+#   error: failed to select a version for the requirement `yah-workload-spec = "^0.8.39"`
+#   candidate versions found which didn't match: 0.8.37, 0.8.36, ...
+#
+# This is the identical bridge oss/qed, oss/yubaba and oss/kamaji already carry,
+# for the identical reason, and it exists so monorepo edits stay atomic — NOT to
+# substitute a fork for a published crate. It also has a consequence worth
+# knowing before it surprises someone: `scripts/export-oss.sh` detects a
+# `[patch.crates-io]` block and switches that repo to a SNAPSHOT export
+# (export-oss.sh:245-272), so passway's mirror now gains one
+# `export: passway snapshot (patch stripped)` commit per export instead of
+# per-commit history. Its existing history is preserved and grafted onto; this
+# is the same trade kamaji/yubaba/qed already make (export-oss.sh:43).
 [workspace.package]
-version = "0.8.37"
+version = "0.8.40"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/yah-ai/passway"
+
+# --- profiles: keep in lockstep with the yah monorepo root Cargo.toml ---
+#
+# `exclude = ["oss", "external"]` in the root makes this a genuine separate
+# workspace, so it inherits NOTHING from it — until 2026-09-12 everything here
+# built at cargo's defaults (`debug = true`, `opt-level = 0`) for the entire
+# dependency graph. Two reasons that was wrong:
+#
+#   Disk. Full DWARF on every dependency is what made `oss/yubaba/target` 16G
+#   and `oss/cheers/target` 11G, nearly all of it debuginfo nobody reads in
+#   this camp. `line-tables-only` keeps the part that IS consumed — file:line
+#   backtraces and panic locations — and drops the type/variable DWARF.
+#
+#   sccache. Its cache key includes rustc flags, so one dependency compiled at
+#   `debug = true` here and `debug = false` from the root is two entries for
+#   one crate, and every cross-workspace hit was silently lost.
+#
+# Changing these invalidates every prior artifact and sccache entry for this
+# workspace (different flags -> different hashes); that was the point. If you
+# need to single-step a dependency, override it per-package locally rather
+# than reverting the `"*"` glob.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 1
+# W308/R745-T1: `-C incremental` makes sccache refuse a crate outright. This
+# glob applies to DEPENDENCIES and never to workspace members, so crates you
+# edit here keep incremental and crates you merely consume become cacheable.
+incremental = false

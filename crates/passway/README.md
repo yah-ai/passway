@@ -46,6 +46,9 @@ PASSWAY_UPSTREAMS=10.0.0.1:8080,10.0.0.2:8080 \
 | `PASSWAY_AUTH_REQUIRED_PREFIXES` | path prefixes requiring a bearer | empty (anonymous) |
 | `PASSWAY_HOLDING_DIR` | directory of per-authority holding pages (see below) | unset (one page for everyone) |
 | `PASSWAY_HOLDING_RELOAD_SECS` | how often that directory is re-read | `30` |
+| `YAH_SERVICE_IDENT` | this door's mesh ident. Set **together with** `YAH_SCRYER_SOCKET` it arms OTel span emission: a `Server` span per request and a `Client` span per upstream call, with W3C `traceparent` continued onto the forwarded request | unset (untraced) |
+| `YAH_SCRYER_SOCKET` | local collector socket finished spans are written to | unset (untraced) |
+| `PASSWAY_TRACE_SAMPLE` | head sample ratio, `0.0..=1.0`, decided from the trace id so every hop agrees | `1.0` |
 
 Auth is off until `PASSWAY_AUTH_PUBLIC_KEY_FILE` is set; an empty upstream set
 fails *ready* (reports `/health` unready) rather than crashing, so a cold start

@@ -114,6 +114,7 @@ pub mod routing;
 pub mod sd_notify;
 pub mod socket_activation;
 pub mod tls;
+pub mod trace;
 pub mod upstream;
 
 pub use acme::{AcmeConfig, AcmeDirectory, AcmeRenewalService};
@@ -126,4 +127,6 @@ pub use path_routes_file::{PathRouteEntry, PathRoutesError, PathRoutesFile};
 pub use proxy::PassProxy;
 pub use routing::{build_host_router, HostKey, HostRouter};
 pub use tls::TlsMode;
+pub use trace::{RequestTrace, SampleRatio, SpanExportService, SpanSink, TraceParent};
+
 pub use upstream::{StaticUpstreams, UpstreamSource};
