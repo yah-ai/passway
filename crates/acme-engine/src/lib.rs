@@ -123,6 +123,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -626,6 +627,24 @@ fn dns_name_covers(have: &str, want: &str) -> bool {
 ///
 /// `pub` so the deployment shell can reuse the exact same atomic-write
 /// primitive for its cert-to-disk write rather than duplicating the logic.
+///
+/// R925 CONVERTED — the staging file is per-writer, not per-path. passway runs
+/// under pingora's graceful upgrade (`PASSWAY_UPGRADE`, `conf.upgrade_sock`),
+/// which is not an edge case here but the *designed* renewal sequence: the
+/// renewal service writes a new cert and logs "this process keeps serving the
+/// OLD cert until a graceful-upgrade restart picks up the new files — trigger
+/// one now". During that window two passway processes are live on one state dir
+/// (`/var/lib/passway-<name>/`), and the successor's bootstrap
+/// `ensure_cert_on_disk` can be issuing while the predecessor's
+/// `AcmeRenewalService` loop is still ticking. With a fixed `<file>.tmp` both
+/// staged into the same file, and the rename published whichever bytes were
+/// there — for `cert_path`/`key_path` a torn PEM, for the account cache a
+/// truncated JSON credential blob.
+///
+/// The `mode` is unchanged and still applies to the staging file rather than to
+/// the final path, so the 0600 key and account-credential writes are never
+/// observable world-readable through the rename. That is why this stayed a
+/// hand-rolled `OpenOptions` write instead of gaining a mode-less helper.
 pub fn write_file_atomic(path: &Path, contents: &[u8], #[allow(unused_variables)] mode: u32) -> io::Result<()> {
     let tmp_path = tmp_sibling(path);
     {
@@ -641,13 +660,29 @@ pub fn write_file_atomic(path: &Path, contents: &[u8], #[allow(unused_variables)
         file.write_all(contents)?;
         file.sync_all()?;
     }
-    std::fs::rename(&tmp_path, path)?;
+    // Remove the staging file if the rename fails. Load-bearing now that the
+    // name is unique per writer: nothing later reuses a leaked one the way a
+    // fixed `<file>.tmp` was reused, so without this they accumulate in the
+    // state dir beside the cert without bound.
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
     Ok(())
 }
 
+/// Distinguishes two staging files made by the same process. The pid separates
+/// the two passway processes that overlap across a graceful upgrade; this
+/// separates concurrent writers inside one of them.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A staging path beside `path` that no concurrent writer will pick:
+/// `<file>.tmp.<pid>.<seq>`. See [`write_file_atomic`] for why a fixed `.tmp`
+/// was not enough (R925).
 fn tmp_sibling(path: &Path) -> PathBuf {
     let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    path.with_file_name(format!("{file_name}.tmp"))
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!("{file_name}.tmp.{}.{seq}", std::process::id()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1349,7 +1384,30 @@ mod tests {
         let path = dir.0.join("creds.json");
         write_file_atomic(&path, b"the contents", 0o600).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "the contents");
-        assert!(!path.with_file_name("creds.json.tmp").exists());
+        // Asserted over the whole directory rather than against one literal
+        // name: since R925 the staging name carries a pid and a sequence
+        // number, so a leak would not land at any path this test could spell
+        // out, and `!creds.json.tmp.exists()` would pass vacuously.
+        let staged: Vec<_> = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(staged.is_empty(), "staging files left behind: {staged:?}");
+    }
+
+    /// The R925 property itself: two writers of one destination must not share
+    /// a staging file, or they interleave into it and the rename publishes a
+    /// torn PEM / truncated credential blob.
+    #[test]
+    fn two_stagings_of_one_destination_do_not_collide() {
+        let path = Path::new("/var/lib/passway-yah/cert.pem");
+        assert_ne!(tmp_sibling(path), tmp_sibling(path));
+        assert!(tmp_sibling(path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("cert.pem.tmp."));
     }
 
     #[cfg(unix)]

@@ -58,7 +58,7 @@ resolver = "2"
 # per-commit history. Its existing history is preserved and grafted onto; this
 # is the same trade kamaji/yubaba/qed already make (export-oss.sh:43).
 [workspace.package]
-version = "0.8.40"
+version = "0.8.41"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"

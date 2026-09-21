@@ -377,6 +377,18 @@ fn load_cache(path: &Path, max_age: Duration) -> BTreeMap<String, Vec<SocketAddr
 
 /// Write every source's held set, atomically (temp file + rename) so a crash
 /// mid-write leaves the previous cache rather than a truncated one.
+///
+/// R925 CONVERTED — staging is per-writer now, via the workspace's one
+/// atomic-write primitive rather than a second hand-rolled copy of it.
+/// Per-hostkey paths (`discovery_cache_path`) already keep two hostkeys inside
+/// one process off each other's file, but that is orthogonal to the race here:
+/// passway runs under pingora's graceful upgrade, so across a changeover two
+/// processes are live on the same state dir, each ticking its own load-balancer
+/// background service, each writing *the same* hostkey's cache. A fixed
+/// `<stem>.json.tmp` was shared by both. `load_cache` treats a malformed cache
+/// as no cache, so the visible symptom is not a parse error but a door that
+/// fail-ready 503s until its first successful poll — precisely the restart
+/// behaviour this cache exists to prevent.
 fn save_cache(path: &Path, sources: &[PolledSource]) {
     let mut map = BTreeMap::new();
     for source in sources {
@@ -403,20 +415,16 @@ fn save_cache(path: &Path, sources: &[PolledSource]) {
             return;
         }
     };
-    let tmp = path.with_extension("json.tmp");
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             log::warn!("{}: cannot create discovery cache dir ({e})", parent.display());
             return;
         }
     }
-    if let Err(e) = std::fs::write(&tmp, &body) {
-        log::warn!("{}: discovery cache write failed ({e})", tmp.display());
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        log::warn!("{}: discovery cache rename failed ({e})", path.display());
-        let _ = std::fs::remove_file(&tmp);
+    // 0644: the cache holds mesh addresses, not secrets, which is the mode the
+    // previous `std::fs::write` produced under the default umask anyway.
+    if let Err(e) = acme_engine::write_file_atomic(path, body.as_bytes(), 0o644) {
+        log::warn!("{}: discovery cache write failed ({e})", path.display());
     }
 }
 

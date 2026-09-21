@@ -1012,9 +1012,16 @@ mod tests {
         write_cert_atomic(&config.cert_path, &config.key_path, "the cert chain", "the private key").unwrap();
         assert_eq!(std::fs::read_to_string(&config.cert_path).unwrap(), "the cert chain");
         assert_eq!(std::fs::read_to_string(&config.key_path).unwrap(), "the private key");
-        // No leftover .tmp siblings.
-        assert!(!Path::new(&format!("{}.tmp", config.cert_path)).exists());
-        assert!(!Path::new(&format!("{}.tmp", config.key_path)).exists());
+        // No leftover staging siblings. Scanned over the directory rather than
+        // against two literal names: since R925 the staging name carries a pid
+        // and a sequence number, so `!"<file>.tmp".exists()` would now pass
+        // whether or not anything leaked.
+        let staged: Vec<_> = std::fs::read_dir(Path::new(&config.cert_path).parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(staged.is_empty(), "staging files left behind: {staged:?}");
     }
 
     #[cfg(unix)]
