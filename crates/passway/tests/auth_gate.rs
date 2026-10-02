@@ -140,6 +140,42 @@ async fn valid_bearer_on_protected_route_reaches_upstream() {
     );
 }
 
+/// R556-F6: a host-scoped rule gates exactly the authority it names, on the
+/// real request path — the Host the proxy resolves, not a unit-test argument.
+#[tokio::test]
+async fn a_host_scoped_rule_gates_only_its_host_through_the_proxy() {
+    let kp = keypair();
+    let verifier = PasetoV4PublicVerifier::from_public_key(&pubkey_bytes(&kp)).unwrap();
+    let auth = CheersAuth::new(verifier, KID, ISS, AUD);
+    let policy = RouteAuthPolicy::parse_required_prefixes("secret.test=/").unwrap();
+
+    let upstream = common::spawn_fake_upstream("backend").await;
+    let (proxy, lb_background) = common::build_proxy_with_auth(vec![upstream], auth, policy);
+    let listen = common::free_addr();
+    common::start_proxy(proxy, lb_background, listen);
+    let client = reqwest::Client::new();
+    let base = format!("http://{listen}");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !matches!(client.get(format!("{base}/health")).send().await, Ok(r) if r.status() == 200) {
+        assert!(tokio::time::Instant::now() < deadline, "fake upstream never became healthy");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let get = |host: &'static str, bearer: Option<String>| {
+        let mut req = client.get(format!("{base}/dash")).header("Host", host);
+        if let Some(b) = bearer {
+            req = req.header("Authorization", format!("Bearer {b}"));
+        }
+        req.send()
+    };
+
+    assert_eq!(get("secret.test", None).await.unwrap().status(), 401);
+    assert_eq!(get("SECRET.test", None).await.unwrap().status(), 401, "host match is case-insensitive");
+    assert_eq!(get("public.test", None).await.unwrap().status(), 200, "other hosts stay anonymous");
+    let token = mint(&kp, KID, ISS, AUD, 4_000_000_000);
+    assert_eq!(get("secret.test", Some(token)).await.unwrap().status(), 200);
+}
+
 #[tokio::test]
 async fn unlisted_route_is_anonymous_by_default() {
     let (client, base, _kp) = setup().await;

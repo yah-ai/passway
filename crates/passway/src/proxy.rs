@@ -118,6 +118,12 @@ pub struct RequestCtx {
     upstream_opts: Option<UpstreamOpts>,
     route_headers: Vec<(String, String)>,
     trace: Option<trace::RequestTrace>,
+    /// R936-B1: how many front doors this request had already crossed when it
+    /// arrived ([`crate::owner::DOOR_HOP_HEADER`]).
+    door_hop: u8,
+    /// R936-B1: the backend `upstream_peer` chose is another front door, so
+    /// the forwarded request carries `door_hop + 1`.
+    forward_counts_door_hop: bool,
 }
 
 /// Which axis this proxy dispatches on — the "one mechanism, two
@@ -532,6 +538,7 @@ impl ProxyHttp for PassProxy {
         // returns path-and-query, so `path_only` strips the query.
         let (path_bytes, has_conflict, bearer, host, wants_html, traced) = {
             let req = session.req_header();
+            ctx.door_hop = crate::owner::arrival_door_hop(&req.headers);
             let path_bytes = path_only(req.raw_path()).to_vec();
             let has_conflict = hardening::has_conflicting_length_headers(&req.headers);
             let bearer = auth::bearer_from_headers(&req.headers).map(str::to_owned);
@@ -576,6 +583,23 @@ impl ProxyHttp for PassProxy {
             let status = body.status_code();
             let json = serde_json::to_value(&body).unwrap_or_default();
             respond_json(session, status, &json).await?;
+            return Ok(true);
+        }
+
+        // R936-B1 loop bound: owner-following doors fall back to each other,
+        // and two doors that are both in fallback would bounce a request
+        // between them forever. After /health (a probe must still see the door)
+        // and before any routing.
+        if ctx.door_hop >= crate::owner::MAX_DOOR_HOPS {
+            respond_json(
+                session,
+                508,
+                &serde_json::json!({
+                    "error": "request crossed too many front doors (owner-route loop)",
+                    "door_hops": ctx.door_hop,
+                }),
+            )
+            .await?;
             return Ok(true);
         }
 
@@ -635,7 +659,15 @@ impl ProxyHttp for PassProxy {
             // A route that requires auth but has no verifier configured
             // fails closed (indistinguishable from "no/invalid bearer" to the
             // caller — never leaks "this deployment is misconfigured").
-            if self.route_policy.auth_required_for(path_for_auth) {
+            // R556-F6: the SAME resolved authority the router selects by
+            // below, so a host-scoped rule and the upstream it protects can
+            // never disagree about which tenant this is. Missing/Ambiguous
+            // pass `None`, which the policy holds to every host's rules.
+            let auth_host = match &host {
+                HostOutcome::Host(h) => Some(h.as_str()),
+                _ => None,
+            };
+            if self.route_policy.auth_required_for(auth_host, path_for_auth) {
                 let now = now_unix();
                 let authed = bearer
                     .as_deref()
@@ -761,6 +793,11 @@ impl ProxyHttp for PassProxy {
                 if let Some(t) = ctx.trace.as_mut() {
                     t.set_peer_address(&backend.addr.to_string());
                 }
+                // R936-B1: a per-backend override (set by an owner-following
+                // source, whose members differ in scheme) beats the set's.
+                let opts = backend.ext.get::<UpstreamOpts>().cloned().unwrap_or(opts);
+                ctx.forward_counts_door_hop =
+                    backend.ext.get::<crate::owner::CountsDoorHop>().is_some();
                 Ok(Box::new(HttpPeer::new(backend, opts.tls, opts.sni)))
             }
             // request_filter already gated emptiness; reaching here means a
@@ -810,6 +847,12 @@ impl ProxyHttp for PassProxy {
         if let Some(t) = ctx.trace.as_mut() {
             let value = t.begin_client_leg();
             upstream_request.insert_header(trace::TRACEPARENT, value)?;
+        }
+        if ctx.forward_counts_door_hop {
+            upstream_request.insert_header(
+                crate::owner::DOOR_HOP_HEADER,
+                ctx.door_hop.saturating_add(1).to_string(),
+            )?;
         }
         Ok(())
     }

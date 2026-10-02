@@ -62,16 +62,45 @@
 //! divergent-normalizer trap [`crate::path`] exists to avoid, moved to the
 //! config boundary. This module rejects only what the router cannot see: a
 //! wrong `schema_version`, an empty table, and a mount with no upstreams.
+//!
+//! ## A mount can follow its workload (R936-B12)
+//!
+//! A mount names its backends one of two ways, never both:
+//!
+//! - `upstreams` — fixed addresses, for a unit pinned to where it runs.
+//! - `discover` — `{ "ident": ..., "yubaba": [urls] }`: the mount polls every
+//!   listed yubaba's `/service-records` for that ident, exactly as a host-routed
+//!   door does ([`crate::discovery::YubabaUpstreams`]), and unions the answers.
+//!   This is what lets an inner door survive its units moving: a floater that
+//!   the cluster re-homes shows up in the new node's records and the mount
+//!   follows it on the next poll. A fixed address baked into this file at
+//!   deploy time points at the dead node forever, which is how noisetable.com
+//!   went 503 on all three doors when us-east-001 went off (R936-B1).
+//!
+//! The discovery URLs live in the file, not in `PASSWAY_YUBABA_URL`, because a
+//! path-routed door refuses the host-routing variables outright. The one env
+//! var it shares is `PASSWAY_DISCOVERY_CACHE` (a directory), which gives each
+//! discovering mount a last-known-good cache across restarts, keyed by ident.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::discovery::{YubabaDiscoveryConfig, YubabaUpstreams};
 use crate::path_route::MountSource;
 use crate::upstream::{StaticUpstreams, UpstreamSource};
+
+/// How long one discovering mount waits on one yubaba. Same default a
+/// host-routed door uses (`PASSWAY_YUBABA_TIMEOUT_SECS`).
+const DISCOVER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How old a discovering mount's on-disk cache may be before a restart refuses
+/// to seed from it. Same default as `PASSWAY_DISCOVERY_CACHE_MAX_AGE_SECS`.
+const DISCOVER_CACHE_MAX_AGE: Duration = Duration::from_secs(300);
 
 /// Environment variable naming the route-table file. Set = this process is a
 /// path-routed inner door; unset = the host-routed grammars decide, exactly as
@@ -129,10 +158,16 @@ pub struct PathRouteEntry {
     /// `""` is the service root / catch-all; otherwise `/segment[/segment…]`.
     /// Validated by [`crate::path_route::PathRouter::new`], not here.
     pub mount: String,
-    /// Addresses serving this mount, round-robined and health-checked exactly
-    /// like a host-routed set's. Must be non-empty — a mount with no upstream
-    /// is a generator bug that would present as an unexplained 503.
+    /// Fixed addresses serving this mount, round-robined and health-checked
+    /// exactly like a host-routed set's. A mount names these OR `discover`,
+    /// exactly one of the two — a mount with neither is a generator bug that
+    /// would present as an unexplained 503.
+    #[serde(default)]
     pub upstreams: Vec<String>,
+    /// Find this mount's backends from yubaba's service records instead of a
+    /// fixed list (R936-B12). See the module doc.
+    #[serde(default)]
+    pub discover: Option<MountDiscovery>,
     /// Response headers this mount earns, e.g. the domain manifest's
     /// COOP/COEP pair. Applied only to responses this mount served (see
     /// `PassProxy::response_filter`).
@@ -162,27 +197,70 @@ impl PathRoutesFile {
             ));
         }
         for route in &file.routes {
-            if route.upstreams.is_empty() {
-                return Err(PathRoutesError(format!(
-                    "mount {:?} names no upstream — a mount with no backend can only 503, \
-                     and silently",
-                    route.mount
-                )));
+            match (&route.discover, route.upstreams.is_empty()) {
+                (None, true) => {
+                    return Err(PathRoutesError(format!(
+                        "mount {:?} names no upstream and no discover — a mount with no \
+                         backend can only 503, and silently",
+                        route.mount
+                    )))
+                }
+                (Some(_), false) => {
+                    return Err(PathRoutesError(format!(
+                        "mount {:?} names both upstreams and discover — one mount has one \
+                         source of backends; a fixed list beside discovery would keep \
+                         routing to an address the workload left",
+                        route.mount
+                    )))
+                }
+                (Some(d), true) if d.ident.trim().is_empty() || d.yubaba.is_empty() => {
+                    return Err(PathRoutesError(format!(
+                        "mount {:?}: discover needs a non-empty ident and at least one yubaba \
+                         URL to poll",
+                        route.mount
+                    )))
+                }
+                _ => {}
             }
         }
         Ok(file)
     }
 
-    /// Resolve every entry's addresses and hand back
-    /// [`crate::path_route::build_path_router`]'s input.
+    /// Resolve every entry's backends and hand back
+    /// [`crate::path_route::build_path_router`]'s input. `cache_dir` is
+    /// `PASSWAY_DISCOVERY_CACHE`: where a discovering mount keeps its
+    /// last-known-good set across restarts (`None` = no cache).
     ///
     /// Address parse failures are refused rather than skipped: a table that
     /// half-loads routes some paths to the right place and the rest to a 503,
     /// which is the shape of outage nobody attributes to a typo.
-    pub fn into_mount_sources(self) -> Result<Vec<MountSource>, PathRoutesError> {
+    pub fn into_mount_sources(
+        self,
+        cache_dir: Option<&Path>,
+    ) -> Result<Vec<MountSource>, PathRoutesError> {
         self.routes
             .into_iter()
             .map(|route| {
+                if let Some(d) = route.discover {
+                    let config = YubabaDiscoveryConfig {
+                        base_urls: d.yubaba,
+                        cache_path: cache_dir.map(|dir| dir.join(format!("mount-{}.json", cache_stem(&d.ident)))),
+                        ident: d.ident,
+                        timeout: DISCOVER_TIMEOUT,
+                        cache_max_age: DISCOVER_CACHE_MAX_AGE,
+                    };
+                    log::info!(
+                        "inner-door mount {:?}: discovering ident {:?} from {:?}",
+                        route.mount,
+                        config.ident,
+                        config.urls()
+                    );
+                    return Ok(MountSource::new(
+                        route.mount,
+                        Arc::new(YubabaUpstreams::new(&config)) as Arc<dyn UpstreamSource>,
+                    )
+                    .with_headers(route.headers.into_iter().collect()));
+                }
                 let addrs = route
                     .upstreams
                     .iter()
@@ -214,9 +292,32 @@ pub fn load(path: &Path) -> Result<Vec<MountSource>, PathRoutesError> {
             path.display()
         ))
     })?;
+    let cache_dir = std::env::var("PASSWAY_DISCOVERY_CACHE")
+        .ok()
+        .filter(|d| !d.trim().is_empty())
+        .map(std::path::PathBuf::from);
     PathRoutesFile::parse(&src)
         .map_err(|e| PathRoutesError(format!("{} ({ROUTES_FILE_ENV}) {e}", path.display())))?
-        .into_mount_sources()
+        .into_mount_sources(cache_dir.as_deref())
+}
+
+/// A mount's discovery source: which workload, and which yubabas to ask.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MountDiscovery {
+    /// The workload's mesh ident, as it appears in `/service-records`.
+    pub ident: String,
+    /// Base URLs (`http://<mesh-ip>:7443`) of every node the workload may run
+    /// on. List them all: a floater is only found where it is polled for.
+    pub yubaba: Vec<String>,
+}
+
+/// Idents are config, so the cache file name is sanitized rather than trusted.
+fn cache_stem(ident: &str) -> String {
+    ident
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .collect()
 }
 
 #[cfg(test)]
@@ -241,7 +342,7 @@ mod tests {
     fn a_two_mount_table_parses_into_mount_sources() {
         let sources = PathRoutesFile::parse(TWO_MOUNTS)
             .expect("valid table")
-            .into_mount_sources()
+            .into_mount_sources(None)
             .expect("resolvable addresses");
         assert_eq!(sources.len(), 2);
         assert_eq!(sources[0].mount, "");
@@ -268,7 +369,7 @@ mod tests {
     fn a_parsed_table_builds_a_router_that_resolves_its_mounts() {
         let sources = PathRoutesFile::parse(TWO_MOUNTS)
             .unwrap()
-            .into_mount_sources()
+            .into_mount_sources(None)
             .unwrap();
         let (router, _services) = build_path_router(
             sources,
@@ -293,6 +394,77 @@ mod tests {
     fn an_empty_table_is_refused_rather_than_503ing_every_request() {
         let err = PathRoutesFile::parse(r#"{"schema_version": 1, "routes": []}"#).unwrap_err();
         assert!(err.to_string().contains("names no route"), "{err}");
+    }
+
+    #[test]
+    fn a_discover_mount_must_stand_alone_and_be_complete() {
+        let both = r#"{"schema_version": 1, "routes": [{"mount": "", "upstreams": ["127.0.0.1:1"],
+            "discover": {"ident": "x", "yubaba": ["http://127.0.0.1:7443"]}}]}"#;
+        let err = PathRoutesFile::parse(both).unwrap_err();
+        assert!(err.to_string().contains("both upstreams and discover"), "{err}");
+
+        let no_urls = r#"{"schema_version": 1, "routes": [{"mount": "",
+            "discover": {"ident": "x", "yubaba": []}}]}"#;
+        let err = PathRoutesFile::parse(no_urls).unwrap_err();
+        assert!(err.to_string().contains("at least one yubaba"), "{err}");
+
+        let typo = r#"{"schema_version": 1, "routes": [{"mount": "",
+            "discover": {"ident": "x", "yubabas": ["http://127.0.0.1:7443"]}}]}"#;
+        assert!(PathRoutesFile::parse(typo).is_err(), "a misspelled discover key must not boot");
+    }
+
+    /// One tiny HTTP responder answering every request with `body`.
+    async fn serve(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// R936-B12: a discovering mount finds its unit on whichever listed node
+    /// runs it — here the second of two — and takes only that ident's
+    /// records, so it follows a floater the cluster re-homed.
+    #[tokio::test]
+    async fn a_discover_mount_follows_its_ident_across_every_listed_yubaba() {
+        let empty_node = serve(r#"{"version":1,"records":[
+            {"ident":"noisetable","endpoints":["100.64.0.2:41000"],"health":"ready",
+             "mesh_ip":"100.64.0.2","ports":[41000],"container_id":"c","observed_at_unix_ms":1}
+        ]}"#)
+        .await;
+        let owner_node = serve(r#"{"version":1,"records":[
+            {"ident":"noisetable-marketing-issues","endpoints":["100.64.0.1:4333"],"health":"ready",
+             "mesh_ip":"100.64.0.1","ports":[4333],"container_id":"c","observed_at_unix_ms":1}
+        ]}"#)
+        .await;
+        let table = format!(
+            r#"{{"schema_version": 1, "routes": [
+                {{"mount": "", "upstreams": ["127.0.0.1:8081"]}},
+                {{"mount": "/api/issues", "discover": {{"ident": "noisetable-marketing-issues",
+                  "yubaba": ["{empty_node}", "{owner_node}"]}}}}
+            ]}}"#
+        );
+        let sources = PathRoutesFile::parse(&table)
+            .unwrap()
+            .into_mount_sources(None)
+            .unwrap();
+        let issues = sources.iter().find(|s| s.mount == "/api/issues").unwrap();
+        assert_eq!(
+            issues.source.addrs().await,
+            vec!["100.64.0.1:4333".parse::<SocketAddr>().unwrap()]
+        );
     }
 
     #[test]
@@ -327,7 +499,7 @@ mod tests {
                  {"mount": "/app", "upstreams": ["not-an-address"]}]}"#,
         )
         .unwrap()
-        .into_mount_sources()
+        .into_mount_sources(None)
         {
             Ok(_) => panic!("a malformed address must refuse the table"),
             Err(e) => e,
@@ -345,7 +517,7 @@ mod tests {
                  {"mount": "app/", "upstreams": ["127.0.0.1:8081"]}]}"#,
         )
         .unwrap()
-        .into_mount_sources()
+        .into_mount_sources(None)
         .unwrap();
         let err = match build_path_router(
             sources,

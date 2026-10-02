@@ -62,6 +62,39 @@ pub trait UpstreamSource: Send + Sync + std::fmt::Debug {
     /// expected — callers must treat it as "no upstreams right now," never
     /// as an error to propagate or panic on.
     async fn addrs(&self) -> Vec<SocketAddr>;
+
+    /// Current upstreams with any per-backend dialing overrides (R936-B1).
+    ///
+    /// A set's scheme is normally one value for the whole set
+    /// ([`crate::routing::UpstreamOpts`] on the `UpstreamSet`). A source whose
+    /// members genuinely differ — [`crate::owner::OwnerUpstreams`] swaps
+    /// between a plain loopback appliance and TLS'd peer doors — overrides
+    /// this; every other source is its [`Self::addrs`] with no override.
+    async fn upstreams(&self) -> Vec<Upstream> {
+        self.addrs().await.into_iter().map(Upstream::inherit).collect()
+    }
+}
+
+/// One discovered backend and how to dial it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upstream {
+    pub addr: SocketAddr,
+    /// `None` = inherit the set's opts (or the proxy default).
+    pub opts: Option<crate::routing::UpstreamOpts>,
+    /// Forwarding here crosses another front door, so the proxy counts it in
+    /// [`crate::owner::DOOR_HOP_HEADER`].
+    pub counts_door_hop: bool,
+}
+
+impl Upstream {
+    /// A backend with no per-backend override.
+    pub fn inherit(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            opts: None,
+            counts_door_hop: false,
+        }
+    }
 }
 
 /// V0's [`UpstreamSource`]: a fixed address set supplied at startup
@@ -97,10 +130,19 @@ struct SourceDiscovery(Arc<dyn UpstreamSource>);
 #[async_trait]
 impl ServiceDiscovery for SourceDiscovery {
     async fn discover(&self) -> pingora::Result<(BTreeSet<Backend>, HashMap<u64, bool>)> {
-        let addrs = self.0.addrs().await;
+        let upstreams = self.0.upstreams().await;
         let mut backends = BTreeSet::new();
-        for addr in addrs {
-            backends.insert(Backend::new(&addr.to_string())?);
+        for up in upstreams {
+            let mut backend = Backend::new(&up.addr.to_string())?;
+            // Carried on the backend itself so `upstream_peer` dials the one
+            // `lb.select` actually chose with the right scheme (R936-B1).
+            if let Some(opts) = up.opts {
+                backend.ext.insert(opts);
+            }
+            if up.counts_door_hop {
+                backend.ext.insert(crate::owner::CountsDoorHop);
+            }
+            backends.insert(backend);
         }
         // No per-backend enablement override — readiness is entirely the
         // TcpHealthCheck's job (see `build_load_balancer`).

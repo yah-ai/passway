@@ -105,6 +105,7 @@ pub mod health;
 pub mod holding;
 pub mod host;
 pub mod idle;
+pub mod owner;
 pub mod path;
 pub mod path_route;
 pub mod path_routes_file;
@@ -129,4 +130,5 @@ pub use routing::{build_host_router, HostKey, HostRouter};
 pub use tls::TlsMode;
 pub use trace::{RequestTrace, SampleRatio, SpanExportService, SpanSink, TraceParent};
 
-pub use upstream::{StaticUpstreams, UpstreamSource};
+pub use owner::{OwnerRouteConfig, OwnerUpstreams};
+pub use upstream::{StaticUpstreams, Upstream, UpstreamSource};

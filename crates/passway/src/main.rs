@@ -32,7 +32,7 @@
 //! | `LISTEN_FDS` / `LISTEN_PID` | R779: systemd socket-activation convention — with `LISTEN_FDS=1` (and `LISTEN_PID` unset or equal to this pid) fd 3 is adopted as the `PASSWAY_LISTEN` socket instead of binding fresh; this is how the process sits behind kamaji's on-demand JIT tier | unset |
 //! | `PASSWAY_IDLE_TTL_SECS` | R779: exit once no request has been in flight for this long — for kamaji's on-demand JIT tier, which re-forks on the next connection. Unset = never | unset |
 //! | `PASSWAY_PATH_ROUTES_FILE` | R870-T18: path to this door's mount table (JSON, see [`passway::path_routes_file`]). Set = this process is a service's own **inner door**, routing by PATH between that service's components; the host-routed variables below are then rejected rather than merged, since one proxy is one strategy | unset (host-routed, as before) |
-//! | `PASSWAY_UPSTREAM_SOURCE` | `static` (from `PASSWAY_UPSTREAMS`) or `yubaba` (R594-F8 discovery) | `static` |
+//! | `PASSWAY_UPSTREAM_SOURCE` | `static` (from `PASSWAY_UPSTREAMS`), `yubaba` (R594-F8 discovery), or `ingress-owner` (R936-B1: follow the raft ingress owner; `PASSWAY_OWNER_*`, see `parse_owner_route_env` and `passway::owner`) | `static` |
 //! | `PASSWAY_UPSTREAMS` | comma-separated backend list, optionally `<hostname>=` prefixed to give each fronted service its own set. R858-T1: honoured under `PASSWAY_UPSTREAM_SOURCE=yubaba` too, as a static pin that beats discovery for the hostnames it names | empty (fail-ready 503) |
 //! | `PASSWAY_YUBABA_URL` | base URL of the yubaba to discover upstreams from, e.g. `http://100.64.0.2:7443`. R844-F23: optionally `<hostname>=` prefixed, and repeating a hostname ADDS a yubaba — one per node the workload is placed on | required if `PASSWAY_UPSTREAM_SOURCE=yubaba` |
 //! | `PASSWAY_YUBABA_IDENT` | R844-B6: workload ident whose service records become this proxy's backends. A node hosts several workloads and the endpoint answers for all of them, so without this passway would adopt every Ready record on the node. R844-F20: optionally `<hostname>=` prefixed, exactly like `PASSWAY_UPSTREAMS`, to give each fronted hostname its own discovered set | required if `PASSWAY_UPSTREAM_SOURCE=yubaba` |
@@ -53,7 +53,7 @@
 //! | `PASSWAY_AUTH_KID` | the `kid` this deployment trusts | required if the key file is set |
 //! | `PASSWAY_AUTH_ISS` | expected PASETO `iss` | required if the key file is set |
 //! | `PASSWAY_AUTH_AUD` | expected PASETO `aud` | required if the key file is set |
-//! | `PASSWAY_AUTH_REQUIRED_PREFIXES` | comma-separated path prefixes requiring a bearer | empty (fully anonymous) |
+//! | `PASSWAY_AUTH_REQUIRED_PREFIXES` | comma-separated path prefixes requiring a bearer. A bare `/prefix` applies to every fronted hostname; `<hostname>=/prefix` (repeatable) to that hostname only (R556-F6) — so one door can front a public site and a confidential tenant | empty (fully anonymous) |
 //! | `PASSWAY_PID_FILE` | pingora's pid file (per-instance path — required for a supervisor to target the right process with a graceful-upgrade signal on a node running more than one instance) | `/tmp/pingora.pid` |
 //! | `PASSWAY_UPGRADE_SOCK` | pingora's graceful-upgrade fd-handoff socket (per-instance path, same reason) | `/tmp/pingora_upgrade.sock` |
 //! | `PASSWAY_UPGRADE` | `true` to start this process in graceful-upgrade mode (receive listening fds from a running sibling over `PASSWAY_UPGRADE_SOCK` instead of binding fresh) | `false` |
@@ -912,12 +912,75 @@ fn merge_static_over_discovered(
 /// The host-routed grammars, by name — everything an inner door must NOT also
 /// be configured with. Kept as one list so [`path_routes_from_env`]'s refusal
 /// and this file's env table cannot drift apart.
-const HOST_ROUTING_ENV: [&str; 4] = [
+const HOST_ROUTING_ENV: [&str; 5] = [
     "PASSWAY_UPSTREAM_SOURCE",
     "PASSWAY_UPSTREAMS",
     "PASSWAY_YUBABA_URL",
     "PASSWAY_YUBABA_IDENT",
+    "PASSWAY_OWNER_URL",
 ];
+
+/// R936-B1: read `PASSWAY_UPSTREAM_SOURCE=ingress-owner`'s variables. Pure over
+/// `get` so the grammar is testable without touching the process env.
+///
+/// | var | meaning | default |
+/// |---|---|---|
+/// | `PASSWAY_OWNER_URL` | this node's yubaba `/cluster/ingress-owner`, e.g. `http://100.64.0.1:7443/cluster/ingress-owner` | required |
+/// | `PASSWAY_OWNER_LOCAL` | the appliance on THIS node, plain HTTP, e.g. `127.0.0.1:8080` | required |
+/// | `PASSWAY_OWNER_PEERS` | the OTHER doors' public `ip:port`s, comma-separated — the fallback that must work with no mesh | empty (warned) |
+/// | `PASSWAY_OWNER_SNI` | SNI on every remote leg; also the hostname the set fronts | required |
+/// | `PASSWAY_OWNER_REMOTE_PORT` | port an owner door answers on | `443` |
+/// | `PASSWAY_OWNER_TIMEOUT_MS` | per-poll timeout | `1500` |
+fn parse_owner_route_env(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<(HostKey, passway::OwnerRouteConfig), String> {
+    let req = |k: &str| {
+        get(k)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| format!("{k} is required"))
+    };
+    let url = req("PASSWAY_OWNER_URL")?;
+    let local = req("PASSWAY_OWNER_LOCAL")?
+        .parse::<SocketAddr>()
+        .map_err(|e| format!("PASSWAY_OWNER_LOCAL: {e}"))?;
+    let sni = req("PASSWAY_OWNER_SNI")?.to_ascii_lowercase();
+    let peers = get("PASSWAY_OWNER_PEERS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            p.parse::<SocketAddr>()
+                .map_err(|e| format!("PASSWAY_OWNER_PEERS entry {p:?}: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let remote_port = match get("PASSWAY_OWNER_REMOTE_PORT") {
+        Some(v) if !v.trim().is_empty() => v
+            .trim()
+            .parse::<u16>()
+            .map_err(|e| format!("PASSWAY_OWNER_REMOTE_PORT: {e}"))?,
+        _ => 443,
+    };
+    let timeout_ms = match get("PASSWAY_OWNER_TIMEOUT_MS") {
+        Some(v) if !v.trim().is_empty() => v
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| format!("PASSWAY_OWNER_TIMEOUT_MS: {e}"))?,
+        _ => 1500,
+    };
+    Ok((
+        HostKey::Host(sni.clone()),
+        passway::OwnerRouteConfig {
+            url,
+            local,
+            peers,
+            remote_port,
+            sni,
+            timeout: Duration::from_millis(timeout_ms),
+        },
+    ))
+}
 
 /// The R870-T18 config surface: `PASSWAY_PATH_ROUTES_FILE` names this door's
 /// mount table, and setting it makes this process a service's own inner door
@@ -1017,6 +1080,27 @@ fn build_upstream_sources(tls: &HostScoped<bool>, sni: &HostScoped<String>) -> V
                     .with_opts(opts)
                 })
                 .collect()
+        }
+        // R936-B1: follow the raft ingress owner — see `passway::owner`.
+        "ingress-owner" => {
+            let (key, cfg) = parse_owner_route_env(|k| std::env::var(k).ok())
+                .unwrap_or_else(|e| panic!("PASSWAY_UPSTREAM_SOURCE=ingress-owner: {e}"));
+            if cfg.peers.is_empty() {
+                log::warn!(
+                    "PASSWAY_OWNER_PEERS is empty: when this door cannot trust its own view it has \
+                     nowhere to send {key:?} and will 503 (R936-B5)"
+                );
+            }
+            log::info!(
+                "upstream set {key:?} follows the ingress owner via {} (local {}, peers {:?})",
+                cfg.url,
+                cfg.local,
+                cfg.peers
+            );
+            vec![UpstreamSet::new(
+                key,
+                Arc::new(passway::OwnerUpstreams::new(cfg)) as Arc<dyn UpstreamSource>,
+            )]
         }
         "yubaba" => {
             let raw_url = std::env::var("PASSWAY_YUBABA_URL")
@@ -1152,14 +1236,12 @@ fn build_auth() -> Option<(CheersAuth, RouteAuthPolicy)> {
     let aud = std::env::var("PASSWAY_AUTH_AUD").expect("PASSWAY_AUTH_AUD required with an auth key");
     let auth = CheersAuth::new(verifier, kid, iss, aud);
 
-    let mut policy = RouteAuthPolicy::new();
-    for prefix in env_or("PASSWAY_AUTH_REQUIRED_PREFIXES", "")
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        policy = policy.require_auth(prefix);
-    }
+    // R556-F6: bare prefixes apply to every hostname; `<host>=<prefix>`
+    // entries to that host only. A malformed entry is a boot failure — an
+    // auth rule silently dropped is a confidential route served anonymously.
+    let policy =
+        RouteAuthPolicy::parse_required_prefixes(&env_or("PASSWAY_AUTH_REQUIRED_PREFIXES", ""))
+            .unwrap_or_else(|e| panic!("{e}"));
 
     Some((auth, policy))
 }
@@ -1553,6 +1635,56 @@ fn main() {
     passway::sd_notify::notify_ready(|k| std::env::var(k).ok());
 
     server.run_forever();
+}
+
+#[cfg(test)]
+mod owner_env_tests {
+    use super::*;
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let m: BTreeMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| m.get(k).cloned()
+    }
+
+    #[test]
+    fn the_mesh_door_shape_parses() {
+        let (key, cfg) = parse_owner_route_env(env(&[
+            ("PASSWAY_OWNER_URL", "http://100.64.0.1:7443/cluster/ingress-owner"),
+            ("PASSWAY_OWNER_LOCAL", "127.0.0.1:8080"),
+            ("PASSWAY_OWNER_PEERS", "45.32.194.254:443, 51.81.85.145:443"),
+            ("PASSWAY_OWNER_SNI", "Cloud.Mesh.Yah.Dev"),
+        ]))
+        .unwrap();
+        assert_eq!(key, HostKey::Host("cloud.mesh.yah.dev".into()));
+        assert_eq!(cfg.sni, "cloud.mesh.yah.dev");
+        assert_eq!(cfg.local, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(cfg.peers.len(), 2);
+        assert_eq!(cfg.remote_port, 443);
+        assert_eq!(cfg.timeout, Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn missing_or_malformed_values_are_refused() {
+        assert!(parse_owner_route_env(env(&[])).is_err());
+        let base = [
+            ("PASSWAY_OWNER_URL", "http://x/cluster/ingress-owner"),
+            ("PASSWAY_OWNER_LOCAL", "127.0.0.1:8080"),
+            ("PASSWAY_OWNER_SNI", "cloud.mesh.yah.dev"),
+        ];
+        assert!(parse_owner_route_env(env(&base)).is_ok(), "peers are optional");
+        let mut bad = base.to_vec();
+        bad.push(("PASSWAY_OWNER_PEERS", "vps-4c1efa56:443"));
+        assert!(
+            parse_owner_route_env(env(&bad)).is_err(),
+            "a hostname is not a peer address — the fallback must not need DNS"
+        );
+        let mut bad = base.to_vec();
+        bad[1] = ("PASSWAY_OWNER_LOCAL", "localhost");
+        assert!(parse_owner_route_env(env(&bad)).is_err());
+    }
 }
 
 #[cfg(test)]
