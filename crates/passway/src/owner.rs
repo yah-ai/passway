@@ -178,6 +178,8 @@ pub struct OwnerRouteConfig {
     pub sni: String,
     /// Per-poll timeout.
     pub timeout: Duration,
+    /// R876-T18: `/cluster/ingress-owner` is Peer-class on yubaba.
+    pub signer: yubaba_auth_token::PeerSigner,
 }
 
 /// Resolve a [`Route`] to concrete upstreams.
@@ -207,7 +209,7 @@ pub fn upstreams_for(route: &Route, cfg: &OwnerRouteConfig) -> Vec<Upstream> {
 /// [`UpstreamSource`] that follows the raft ingress owner.
 #[derive(Debug)]
 pub struct OwnerUpstreams {
-    client: reqwest::Client,
+    client: yubaba_auth_token::PeerClient,
     cfg: OwnerRouteConfig,
     /// Last successful view in THIS process — never seeded from disk.
     last: Mutex<Option<OwnerView>>,
@@ -221,6 +223,7 @@ impl OwnerUpstreams {
             .timeout(cfg.timeout)
             .build()
             .expect("reqwest client builds with a timeout only");
+        let client = yubaba_auth_token::PeerClient::new(client, cfg.signer.clone());
         Self {
             client,
             cfg,
@@ -313,6 +316,7 @@ mod tests {
             remote_port: 443,
             sni: "cloud.mesh.yah.dev".into(),
             timeout: Duration::from_millis(200),
+            signer: yubaba_auth_token::PeerSigner::unsigned(),
         }
     }
 

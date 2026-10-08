@@ -1,0 +1,28 @@
+[package]
+name = "yubaba-auth-token"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The yubaba control-plane token format (PASETO v4 claims, audience, scopes, TTL ceiling, key encodings) and the reqwest client that attaches a peer token to every request."
+keywords = ["yubaba", "paseto", "auth", "token"]
+categories = ["authentication"]
+
+[lib]
+path = "src/lib.rs"
+
+# R876-T18: the one owner of the token format. Every process that dials a
+# yubaba peer route links this — the fleet daemon, yubaba-consensus's raft
+# transport, the tenant streamer and passway's discovery poll — so the dep list
+# is held to what minting and attaching a token needs. No axum, no openraft:
+# passway and the streamer must be able to take it without either.
+[dependencies]
+# Same major and features as yubaba's own pasetors (its cheers service
+# principal), so the graph carries one copy.
+pasetors = { version = "0.7", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1.0"
+# `log`: passway logs through `log`/env_logger and installs no tracing
+# subscriber, so without this a mint failure there would warn into nothing.
+tracing = { version = "0.1", features = ["log"] }

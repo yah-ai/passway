@@ -50,7 +50,6 @@
 //!
 //! @yah:relay(R870, "Second tenant on the sovereign front door: the tiers and rails a non-yah.dev apex still lacks")
 //! @yah:at(2026-09-05T20:31:00Z)
-//! @yah:status(open)
 //! @arch:see(.yah/docs/working/W267-sovereign-public-ingress.md)
 
 use std::path::PathBuf;

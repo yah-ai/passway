@@ -237,6 +237,7 @@ impl PathRoutesFile {
     pub fn into_mount_sources(
         self,
         cache_dir: Option<&Path>,
+        signer: &yubaba_auth_token::PeerSigner,
     ) -> Result<Vec<MountSource>, PathRoutesError> {
         self.routes
             .into_iter()
@@ -248,6 +249,7 @@ impl PathRoutesFile {
                         ident: d.ident,
                         timeout: DISCOVER_TIMEOUT,
                         cache_max_age: DISCOVER_CACHE_MAX_AGE,
+                        signer: signer.clone(),
                     };
                     log::info!(
                         "inner-door mount {:?}: discovering ident {:?} from {:?}",
@@ -292,13 +294,17 @@ pub fn load(path: &Path) -> Result<Vec<MountSource>, PathRoutesError> {
             path.display()
         ))
     })?;
+    let signer = crate::discovery::yubaba_peer_signer(
+        std::env::var(crate::discovery::CLUSTER_KEY_FILE_ENV).ok().as_deref(),
+    )
+    .map_err(PathRoutesError)?;
     let cache_dir = std::env::var("PASSWAY_DISCOVERY_CACHE")
         .ok()
         .filter(|d| !d.trim().is_empty())
         .map(std::path::PathBuf::from);
     PathRoutesFile::parse(&src)
         .map_err(|e| PathRoutesError(format!("{} ({ROUTES_FILE_ENV}) {e}", path.display())))?
-        .into_mount_sources(cache_dir.as_deref())
+        .into_mount_sources(cache_dir.as_deref(), &signer)
 }
 
 /// A mount's discovery source: which workload, and which yubabas to ask.
@@ -342,7 +348,7 @@ mod tests {
     fn a_two_mount_table_parses_into_mount_sources() {
         let sources = PathRoutesFile::parse(TWO_MOUNTS)
             .expect("valid table")
-            .into_mount_sources(None)
+            .into_mount_sources(None, &yubaba_auth_token::PeerSigner::unsigned())
             .expect("resolvable addresses");
         assert_eq!(sources.len(), 2);
         assert_eq!(sources[0].mount, "");
@@ -369,7 +375,7 @@ mod tests {
     fn a_parsed_table_builds_a_router_that_resolves_its_mounts() {
         let sources = PathRoutesFile::parse(TWO_MOUNTS)
             .unwrap()
-            .into_mount_sources(None)
+            .into_mount_sources(None, &yubaba_auth_token::PeerSigner::unsigned())
             .unwrap();
         let (router, _services) = build_path_router(
             sources,
@@ -458,7 +464,7 @@ mod tests {
         );
         let sources = PathRoutesFile::parse(&table)
             .unwrap()
-            .into_mount_sources(None)
+            .into_mount_sources(None, &yubaba_auth_token::PeerSigner::unsigned())
             .unwrap();
         let issues = sources.iter().find(|s| s.mount == "/api/issues").unwrap();
         assert_eq!(
@@ -499,7 +505,7 @@ mod tests {
                  {"mount": "/app", "upstreams": ["not-an-address"]}]}"#,
         )
         .unwrap()
-        .into_mount_sources(None)
+        .into_mount_sources(None, &yubaba_auth_token::PeerSigner::unsigned())
         {
             Ok(_) => panic!("a malformed address must refuse the table"),
             Err(e) => e,
@@ -517,7 +523,7 @@ mod tests {
                  {"mount": "app/", "upstreams": ["127.0.0.1:8081"]}]}"#,
         )
         .unwrap()
-        .into_mount_sources(None)
+        .into_mount_sources(None, &yubaba_auth_token::PeerSigner::unsigned())
         .unwrap();
         let err = match build_path_router(
             sources,

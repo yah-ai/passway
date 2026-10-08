@@ -37,6 +37,7 @@
 //! | `PASSWAY_YUBABA_URL` | base URL of the yubaba to discover upstreams from, e.g. `http://100.64.0.2:7443`. R844-F23: optionally `<hostname>=` prefixed, and repeating a hostname ADDS a yubaba — one per node the workload is placed on | required if `PASSWAY_UPSTREAM_SOURCE=yubaba` |
 //! | `PASSWAY_YUBABA_IDENT` | R844-B6: workload ident whose service records become this proxy's backends. A node hosts several workloads and the endpoint answers for all of them, so without this passway would adopt every Ready record on the node. R844-F20: optionally `<hostname>=` prefixed, exactly like `PASSWAY_UPSTREAMS`, to give each fronted hostname its own discovered set | required if `PASSWAY_UPSTREAM_SOURCE=yubaba` |
 //! | `PASSWAY_YUBABA_TIMEOUT_SECS` | per-request timeout for a discovery poll | `5` |
+//! | `PASSWAY_YUBABA_CLUSTER_KEY_FILE` | R876-T18: path to the yubaba cluster-key file (hex, the same file yubaba's `--cluster-key-file` names). Every yubaba poll — discovery, ingress-owner, inner-door mounts — then carries a peer token; unset, they go unsigned and a `require`-mode yubaba 401s them. An unreadable named file is a boot failure | unset (unsigned) |
 //! | `PASSWAY_DISCOVERY_CACHE` | R870-F4: DIRECTORY in which each fronted hostname's last-known-good upstream set is persisted, so a restart holds the previous process's answer instead of fail-ready 503ing for a whole `PASSWAY_UPDATE_INTERVAL_SECS`. Point it at the door's own state dir (`/var/lib/passway-<name>`). A directory, not a file, because one process fronts several hostnames | unset (no persistence; a restart starts cold) |
 //! | `PASSWAY_DISCOVERY_CACHE_MAX_AGE_SECS` | how old a persisted set may be and still be seeded on start. Bounded because backend ports are kamaji-allocated, so a long-stale address may since belong to a different workload — past this, starting cold and 503ing is the correct answer | `300` |
 //! | `PASSWAY_UPSTREAM_TLS` | speak TLS to upstreams. Bare `true`/`false` is the process-wide default; R858-T1 also accepts the `<hostname>=` fan-in form (`cloud.mesh.yah.dev=true,*=false`) to give one fronted service its own scheme. An unrecognized value is a boot failure, not `false` | `false` (mesh is already encrypted) |
@@ -291,7 +292,6 @@
 //!
 //! @yah:relay(R853, "R779 outward actions: publish the pingora fork upstream, put the demux on :443 in front of the live origins, and settle the ACME order budget")
 //! @yah:at(2026-09-03T06:33:30Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:next("Split out of R779 at its P8 close-out. R779's code is complete and verified; these three are the actions that make it REACH the world, and every one of them is outward-facing (a public PR, a change to live yah.dev origins, a request to a third party) rather than something a session should do unsupervised. They were sitting as @yah:next prose on R779, which would have been stripped from source when R779 archived — filed as real tickets so they survive it. Design canon: .yah/docs/working/W267-sovereign-public-ingress.md.")
 //! @yah:notify_on(R858-T3, "R858-T3 is in review: appliance ownership no longer aliases raft leadership, so leadership on us-west-001 is movable and a yubaba restart there no longer moves headscale. That is the gate acme_issuer.rs's R853 gotcha names — 'the fix is correct and unit-tested but UNOBSERVED LIVE, and stays that way until R858-T3 makes leadership movable'. Two caveats before treating the fleet ACME issuer as live: (1) T3 is CODE ONLY, nothing rolled — it takes effect on a node only once that node runs a build containing it; (2) the roll itself must NOT drain us-west-001 with POST /raft/transfer-leader, because that drain executes on the OLD binary (FollowsRaftLeader) and still tears headscale down. See R858-T3's gotchas for the read-only precondition check.")
@@ -978,6 +978,9 @@ fn parse_owner_route_env(
             remote_port,
             sni,
             timeout: Duration::from_millis(timeout_ms),
+            signer: passway::discovery::yubaba_peer_signer(
+                get(passway::discovery::CLUSTER_KEY_FILE_ENV).as_deref(),
+            )?,
         },
     ))
 }
@@ -1103,6 +1106,10 @@ fn build_upstream_sources(tls: &HostScoped<bool>, sni: &HostScoped<String>) -> V
             )]
         }
         "yubaba" => {
+            let signer = passway::discovery::yubaba_peer_signer(
+                std::env::var(passway::discovery::CLUSTER_KEY_FILE_ENV).ok().as_deref(),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
             let raw_url = std::env::var("PASSWAY_YUBABA_URL")
                 .expect("PASSWAY_YUBABA_URL is required with PASSWAY_UPSTREAM_SOURCE=yubaba");
             // R844-F23: one hostname may name SEVERAL yubabas, one per node its
@@ -1195,6 +1202,7 @@ fn build_upstream_sources(tls: &HostScoped<bool>, sni: &HostScoped<String>) -> V
                                 // other every tick.
                                 cache_path: discovery_cache_path(&key),
                                 cache_max_age: env_secs("PASSWAY_DISCOVERY_CACHE_MAX_AGE_SECS", 300),
+                                signer: signer.clone(),
                             };
                             log::info!(
                                 "upstream discovery for {key:?}: polling {:?} for records of \

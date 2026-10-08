@@ -10,7 +10,12 @@
 # reserve-crate-names.sh or `cargo publish` here; that is the operator's
 # move, not this ticket's.
 [workspace]
-members = ["crates/passway", "crates/acme-engine", "crates/sni-demux", "crates/http-router"]
+# `yubaba-auth-token` lives here, not in oss/yubaba, to keep the publish DAG
+# acyclic: passway signs its discovery poll with it, and yubaba already depends
+# on passway (`passway-acme`), so a yubaba-owned copy made the two workspaces a
+# cycle crates.io cannot publish (scripts/oss-publish-order.py). It is a leaf —
+# no in-tree deps — so it moves without dragging anything along.
+members = ["crates/passway", "crates/acme-engine", "crates/sni-demux", "crates/http-router", "crates/yubaba-auth-token"]
 resolver = "2"
 
 # R853-F6 (2026-09-04): the carried pingora fork is GONE. passway used to pin
@@ -58,7 +63,7 @@ resolver = "2"
 # per-commit history. Its existing history is preserved and grafted onto; this
 # is the same trade kamaji/yubaba/qed already make (export-oss.sh:43).
 [workspace.package]
-version = "0.8.42"
+version = "0.8.43"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"

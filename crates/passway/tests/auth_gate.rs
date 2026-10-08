@@ -6,7 +6,7 @@
 
 use crate::common;
 
-use cheers_core::{PrincipalId, Scope};
+use cheers_core::{yah_scopes, PrincipalId};
 use cheers_verify::PasetoV4PublicVerifier;
 use pasetors::keys::{AsymmetricKeyPair, Generate};
 use pasetors::version4::{PublicToken, V4};
@@ -35,7 +35,7 @@ fn mint(kp: &AsymmetricKeyPair<V4>, kid: &str, iss: &str, aud: &str, exp: i64) -
         0,
         exp,
         "test-jti-1",
-        vec![Scope::CloudRead],
+        vec![yah_scopes::CLOUD_READ],
     );
     let payload = serde_json::to_vec(&claims).expect("serialize claims");
     let footer = format!(r#"{{"kid":"{kid}"}}"#).into_bytes();

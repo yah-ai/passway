@@ -153,6 +153,7 @@ fn discovery_sources(yubabas: &[SocketAddr]) -> Arc<YubabaUpstreams> {
         // its own unit tests in `discovery.rs`.
         cache_path: None,
         cache_max_age: Duration::from_secs(300),
+        signer: yubaba_auth_token::PeerSigner::unsigned(),
     }))
 }
 

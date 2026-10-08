@@ -168,6 +168,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use yubaba_auth_token::{PeerClient, PeerSigner};
+
 use crate::upstream::UpstreamSource;
 
 /// Path of yubaba's discovery endpoint. Mirrors
@@ -175,6 +177,31 @@ use crate::upstream::UpstreamSource;
 /// workspace and cannot depend on yubaba, so the contract is re-declared here
 /// rather than shared.
 pub const DISCOVERY_PATH: &str = "/service-records";
+
+/// R876-T18: path to the yubaba cluster-key file (hex — the same file yubaba's
+/// `--cluster-key-file` names). Set, and every call this process makes to
+/// yubaba carries a peer token minted under it; unset, they go unsigned, which
+/// a `warn`-mode yubaba serves and a `require`-mode one 401s. A path rather than
+/// the key: the key is a bearer secret for the whole cluster.
+pub const CLUSTER_KEY_FILE_ENV: &str = "PASSWAY_YUBABA_CLUSTER_KEY_FILE";
+
+/// The signer for this process's yubaba calls, from the raw value of
+/// [`CLUSTER_KEY_FILE_ENV`]. A named file that cannot be read or parsed is an
+/// `Err` (a boot failure) rather than a quiet fall back to unsigned: that
+/// fallback would only surface once the fleet enforces, as a door that cannot
+/// see its backends.
+pub fn yubaba_peer_signer(key_file: Option<&str>) -> Result<PeerSigner, String> {
+    let path = key_file.map(str::trim).filter(|p| !p.is_empty()).map(Path::new);
+    let signer = PeerSigner::from_key_file(path, "svc:passway".to_string())
+        .map_err(|e| format!("{CLUSTER_KEY_FILE_ENV}: {e}"))?;
+    if !signer.is_signing() {
+        log::warn!(
+            "{CLUSTER_KEY_FILE_ENV} is unset: yubaba polls go unsigned and will 401 once yubaba \
+             runs --auth-mode require"
+        );
+    }
+    Ok(signer)
+}
 
 /// Wire schema version this client understands
 /// (`yubaba::service_records::WIRE_VERSION`). A body announcing anything else
@@ -201,8 +228,65 @@ struct ServiceRecordWire {
     /// Pre-paired `mesh_ip:port`, one per declared port. Taken as given rather
     /// than re-derived from `mesh_ip` + `ports` (which this client does not
     /// deserialize at all) so the pairing has exactly one implementation.
+    ///
+    /// Read only for a record that carries no [`Self::named_endpoints`] (a
+    /// yubaba predating R844-F15), and then only when it holds exactly one
+    /// entry — see [`fronted_endpoint`].
     endpoints: Vec<String>,
+    /// The same endpoints keyed by port name (R844-F15). This is what the
+    /// door actually dials: the entry named [`FRONTED_PORT_NAME`]. Absent on
+    /// the wire when empty, hence the default.
+    #[serde(default)]
+    named_endpoints: BTreeMap<String, String>,
     health: String,
+}
+
+/// The port name a front door serves traffic on — `kamaji::DEFAULT_PORT_NAME`,
+/// restated rather than imported because this crate does not link kamaji. It is
+/// the name the allocator gives a sole listener and the name a manifest gives
+/// its serving port, and the same rule `ServiceRecordFanout::port_for` and
+/// `address_for_ident` (oss/yubaba/crates/cloud/src/reconciler/service_discovery.rs)
+/// apply on the planning side, so the door and the planner pick one listener.
+const FRONTED_PORT_NAME: &str = "http";
+
+/// The one endpoint of `record` this door may front, or `None` when the record
+/// does not say which (R844-B25).
+///
+/// Named first: a record with an `http` entry fronts that and nothing else, so
+/// an `admin` or `metrics` listener beside it never enters the backend set. A
+/// record with names but no `http` — what `kamaji::name_anonymous_ports` makes
+/// of `ports = [4332, 4334]` — is ambiguous and refused. A record with no names
+/// at all is an older yubaba; its sole endpoint is unambiguous, two are not.
+///
+/// Refusing is the point. Flattening every endpoint into the backend set is
+/// what put noisetable-account's mesh-only admin listener behind
+/// api.noisetable.com and served 5/12 requests from it; an unroutable workload
+/// is a loud, visible failure, a public admin port is a quiet one.
+fn fronted_endpoint<'a>(record: &'a ServiceRecordWire, context: &str) -> Option<&'a str> {
+    if !record.named_endpoints.is_empty() {
+        let found = record.named_endpoints.get(FRONTED_PORT_NAME).map(String::as_str);
+        if found.is_none() {
+            log::warn!(
+                "{context}: record {:?} names its ports {:?} and none is {FRONTED_PORT_NAME:?} — \
+                 not fronting it; name the serving port `{FRONTED_PORT_NAME}` in the manifest",
+                record.ident,
+                record.named_endpoints.keys().collect::<Vec<_>>()
+            );
+        }
+        return found;
+    }
+    match record.endpoints.as_slice() {
+        [one] => Some(one.as_str()),
+        [] => None,
+        many => {
+            log::warn!(
+                "{context}: record {:?} offers {many:?} with no port names — not fronting it, \
+                 since nothing says which is the {FRONTED_PORT_NAME:?} listener",
+                record.ident
+            );
+            None
+        }
+    }
 }
 
 /// Configuration for [`YubabaUpstreams`].
@@ -256,6 +340,9 @@ pub struct YubabaDiscoveryConfig {
     /// reboot window is not a restart, it is an outage whose backend set
     /// should be re-learned rather than assumed.
     pub cache_max_age: Duration,
+    /// R876-T18: attaches a peer token to every poll — see
+    /// [`yubaba_peer_signer`].
+    pub signer: PeerSigner,
 }
 
 impl YubabaDiscoveryConfig {
@@ -515,7 +602,7 @@ impl PolledSource {
 /// An [`UpstreamSource`] backed by yubaba's service-record surface.
 #[derive(Debug)]
 pub struct YubabaUpstreams {
-    client: reqwest::Client,
+    client: PeerClient,
     /// The yubabas this source polls, one per placement node (R844-F23). One
     /// entry is the ordinary case.
     sources: Vec<PolledSource>,
@@ -536,6 +623,7 @@ impl YubabaUpstreams {
             // Only fails if the TLS backend can't initialize; the same
             // `ring` provider the ACME path already installed.
             .expect("failed to build the yubaba discovery HTTP client");
+        let client = PeerClient::new(client, config.signer.clone());
         // Seeded before the first poll, so the very first `addrs()` — which
         // pingora calls during startup, often while yubaba is still binding —
         // already has the previous process's answer to fall back on.
@@ -586,6 +674,25 @@ impl YubabaUpstreams {
 ///
 /// Split from the request so the whole filter/parse contract is unit-testable
 /// without a live yubaba. `context` only ever appears in log lines.
+///
+/// @yah:ticket(R844-B25, "passway fronts EVERY port of a multi-port service record — addrs_from_body ignores named_endpoints; a second mesh port took ~40% of api.noisetable.com")
+/// @yah:status(review)
+/// @yah:at(2026-10-08T06:35:16Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R844)
+/// @yah:severity(high)
+/// @yah:next("Select the fronted endpoint by NAME: read ServiceRecordWire.named_endpoints and dial the port named kamaji::DEFAULT_PORT_NAME (`http`), the same rule ServiceRecordFanout::port_for uses. A record with several anonymous ports names none of them `http` (kamaji::name_anonymous_ports), so it should be refused loudly (warn + no upstream) rather than flattened.")
+/// @yah:next("Rewrite the test ready_records_become_dialable_addresses, which currently PINS the flattening ([8080, 9090] -> both dialable), and add one where an `http` + `admin` record fronts only `http`.")
+/// @yah:next("Then notify noisetable: its account toml can re-list the admin port as ports = [{ name = \"http\", port = 4332 }, { name = \"admin\", port = 4334 }] (R844-F17 spelling) once passway on us-west-001/us-east-001/us-south-001 runs the fix.")
+/// @yah:gotcha("HIT IN PROD 2026-10-07 ~18:21:33-18:30Z (noisetable R795-T8, @Glimmerstone:coffee). noisetable-account declared [expose.mesh] ports = [4332, 4334], where 4334 is a mesh-only admin listener and [expose.public].port = 4332. passway-noisetable's discovery cache on us-west-001 held [10.128.1.2:4332, 10.128.1.2:4334] and round-robined: 5/12 GET /api/v1/status returned 404 from the admin listener, and the admin door was publicly reachable. noisetable mitigated by unlisting 4334. This is the gap R844-F15's handoff left on purpose ('PASSWAY WAS DELIBERATELY NOT CHANGED ... Nothing has hit it because no fronted workload declares two ports yet'). Now something has.")
+/// @arch:see(.yah/docs/working/W267-sovereign-public-ingress.md)
+/// @yah:handoff("passway now fronts ONE endpoint per ready record, chosen by name: new fronted_endpoint() in oss/passway/crates/passway/src/discovery.rs dials named_endpoints[\"http\"] (FRONTED_PORT_NAME, restated from kamaji::DEFAULT_PORT_NAME since passway does not link kamaji); a record with names but no `http` (what name_anonymous_ports makes of [4332, 4334]) is refused with a warn; a pre-F15 record with no names fronts its sole endpoint, and two unnamed endpoints are refused. Same rule as ServiceRecordFanout::port_for / address_for_ident, so planner and door pick the same listener. ServiceRecordWire gained `named_endpoints` (#[serde(default)]).")
+/// @yah:handoff("Tests: ready_records_become_dialable_addresses no longer pins flattening (named sole port + pre-F15 sole port); added a_multi_port_record_fronts_only_its_http_endpoint (the noisetable http+admin shape), a_record_whose_names_include_no_http_is_refused, an_unnamed_record_with_several_endpoints_is_refused; an_unparsable_endpoint_is_skipped_not_fatal re-shaped to two records since one record now yields at most one endpoint.")
+/// @yah:handoff("Extra: corrected the now-false doc on ServiceRecordWire.named_endpoints at oss/yubaba/crates/yubaba/src/service_records.rs (~1843) which said 'passway does NOT read this yet' — doc-only edit.")
+/// @yah:verify("cargo test --manifest-path oss/passway/Cargo.toml -p passway --lib discovery = 28 passed / 0 failed")
+/// @yah:verify("cargo test --manifest-path oss/passway/Cargo.toml (whole workspace) = all targets ok, lib 241 passed / 0 failed, EXIT=0 (log /tmp/r844b25-t2.log)")
+/// @yah:verify("yubaba edit is a doc comment only; no yubaba build run")
+/// @yah:cleanup("Once passway on us-west-001/us-east-001/us-south-001 runs this fix (needs a passway release + roll — operator), tell noisetable its account toml can re-list the admin port as ports = [{ name = \\\"http\\\", port = 4332 }, { name = \\\"admin\\\", port = 4334 }]. Until then that re-listing would re-expose the admin listener.")
 fn addrs_from_body(
     body: &ServiceRecordsWire,
     ident: &str,
@@ -619,14 +726,17 @@ fn addrs_from_body(
         if record.ident != ident {
             continue;
         }
-        for endpoint in &record.endpoints {
-            match endpoint.parse::<SocketAddr>() {
-                Ok(addr) => addrs.push(addr),
-                Err(e) => log::warn!(
-                    "{context}: skipping unparsable endpoint {endpoint:?} on record {:?}: {e}",
-                    record.ident
-                ),
-            }
+        // One endpoint per record, chosen by name (R844-B25) — never every
+        // endpoint the record lists.
+        let Some(endpoint) = fronted_endpoint(record, context) else {
+            continue;
+        };
+        match endpoint.parse::<SocketAddr>() {
+            Ok(addr) => addrs.push(addr),
+            Err(e) => log::warn!(
+                "{context}: skipping unparsable endpoint {endpoint:?} on record {:?}: {e}",
+                record.ident
+            ),
         }
     }
     Ok(addrs)
@@ -694,6 +804,7 @@ mod tests {
             // was written for. The cache has its own tests.
             cache_path: None,
             cache_max_age: Duration::from_secs(300),
+            signer: PeerSigner::unsigned(),
         }
     }
 
@@ -879,18 +990,64 @@ mod tests {
     fn ready_records_become_dialable_addresses() {
         let b = body(
             r#"{"version":1,"records":[
-                {"ident":"api","endpoints":["100.64.0.5:8080","100.64.0.5:9090"],
-                 "health":"ready","mesh_ip":"100.64.0.5","ports":[8080,9090],
-                 "container_id":"c","observed_at_unix_ms":1}
+                {"ident":"api","endpoints":["100.64.0.5:8080"],
+                 "named_endpoints":{"http":"100.64.0.5:8080"},
+                 "health":"ready","mesh_ip":"100.64.0.5","ports":[8080],
+                 "container_id":"c","observed_at_unix_ms":1},
+                {"ident":"api","endpoints":["100.64.0.6:8080"],"health":"ready"}
             ]}"#,
         );
         assert_eq!(
             addrs_from_body(&b, "api", "test").unwrap(),
-            vec![
-                "100.64.0.5:8080".parse::<SocketAddr>().unwrap(),
-                "100.64.0.5:9090".parse::<SocketAddr>().unwrap(),
-            ]
+            vec![addr("100.64.0.5:8080"), addr("100.64.0.6:8080")],
+            "a named sole port and a pre-F15 sole port both front"
         );
+    }
+
+    /// R844-B25, the shape that hit api.noisetable.com: an `http` listener and
+    /// a mesh-only `admin` one. Only `http` may enter the backend set.
+    #[test]
+    fn a_multi_port_record_fronts_only_its_http_endpoint() {
+        let b = body(
+            r#"{"version":1,"records":[
+                {"ident":"api","endpoints":["10.128.1.2:4332","10.128.1.2:4334"],
+                 "named_endpoints":{"admin":"10.128.1.2:4334","http":"10.128.1.2:4332"},
+                 "health":"ready"}
+            ]}"#,
+        );
+        assert_eq!(addrs_from_body(&b, "api", "test").unwrap(), vec![addr("10.128.1.2:4332")]);
+    }
+
+    /// What `kamaji::name_anonymous_ports` makes of `ports = [4332, 4334]`:
+    /// names, none of them `http`. Refused — not flattened, not guessed.
+    #[test]
+    fn a_record_whose_names_include_no_http_is_refused() {
+        let b = body(
+            r#"{"version":1,"records":[
+                {"ident":"api","endpoints":["10.128.1.2:4332","10.128.1.2:4334"],
+                 "named_endpoints":{"4332":"10.128.1.2:4332","4334":"10.128.1.2:4334"},
+                 "health":"ready"},
+                {"ident":"api","endpoints":["100.64.0.7:8080"],
+                 "named_endpoints":{"http":"100.64.0.7:8080"},"health":"ready"}
+            ]}"#,
+        );
+        assert_eq!(
+            addrs_from_body(&b, "api", "test").unwrap(),
+            vec![addr("100.64.0.7:8080")],
+            "the ambiguous record is dropped; its unambiguous sibling still fronts"
+        );
+    }
+
+    /// A pre-F15 yubaba sends no names; one endpoint is still unambiguous,
+    /// two are not.
+    #[test]
+    fn an_unnamed_record_with_several_endpoints_is_refused() {
+        let b = body(
+            r#"{"version":1,"records":[
+                {"ident":"api","endpoints":["100.64.0.5:8080","100.64.0.5:9090"],"health":"ready"}
+            ]}"#,
+        );
+        assert_eq!(addrs_from_body(&b, "api", "test").unwrap(), Vec::new());
     }
 
     #[test]
@@ -961,13 +1118,14 @@ mod tests {
     fn an_unparsable_endpoint_is_skipped_not_fatal() {
         let b = body(
             r#"{"version":1,"records":[
-                {"ident":"api","endpoints":["not-an-addr","100.64.0.5:80"],"health":"ready"}
+                {"ident":"api","endpoints":["not-an-addr"],"health":"ready"},
+                {"ident":"api","endpoints":["100.64.0.5:80"],"health":"ready"}
             ]}"#,
         );
         assert_eq!(
             addrs_from_body(&b, "api", "test").unwrap(),
             vec!["100.64.0.5:80".parse::<SocketAddr>().unwrap()],
-            "one bad endpoint must not cost the record its good ones"
+            "one bad record must not cost the source its good ones"
         );
     }
 
@@ -1004,6 +1162,65 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// R876-T18: a keyed door's poll carries a peer token yubaba will accept —
+    /// asserted on the bytes that reached the socket, then decrypted and
+    /// validated with the same format crate yubaba's verifier uses.
+    #[tokio::test]
+    async fn a_keyed_poll_carries_a_peer_token_under_the_cluster_key() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use pasetors::token::{Local, UntrustedToken};
+        use pasetors::version4::{LocalToken, V4};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            let body = r#"{"version":1,"records":[]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+        });
+
+        let hex = yubaba_auth_token::generate_cluster_key_hex().unwrap();
+        let key = yubaba_auth_token::cluster_key_from_hex(&hex).unwrap();
+        let mut config = cfg(&base);
+        config.signer = PeerSigner::for_cluster_key(key.clone(), "svc:passway".into());
+        YubabaUpstreams::new(&config).addrs().await;
+
+        let head = rx.await.unwrap();
+        let token = head
+            .lines()
+            .find_map(|l| {
+                let (name, value) = l.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization").then(|| value.trim().to_string())
+            })
+            .expect("the poll must carry an Authorization header");
+        let token = token.strip_prefix("Bearer ").expect("a Bearer credential");
+        let untrusted = UntrustedToken::<Local, V4>::try_from(token).unwrap();
+        let trusted = LocalToken::decrypt(&key, &untrusted, None, None).unwrap();
+        let sub = yubaba_auth_token::validate_claims(
+            trusted.payload(),
+            yubaba_auth_token::PEER_SCOPE,
+            yubaba_auth_token::now_unix(),
+        )
+        .unwrap();
+        assert_eq!(sub, "svc:passway");
+    }
+
+    #[test]
+    fn a_named_but_unreadable_key_file_is_a_boot_failure() {
+        assert!(yubaba_peer_signer(Some("/nonexistent/cluster.key")).is_err());
+        assert!(!yubaba_peer_signer(None).unwrap().is_signing());
+        assert!(!yubaba_peer_signer(Some("  ")).unwrap().is_signing());
     }
 
     #[tokio::test]

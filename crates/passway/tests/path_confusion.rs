@@ -12,7 +12,7 @@ use crate::common;
 
 use std::time::Duration;
 
-use cheers_core::{PrincipalId, Scope};
+use cheers_core::{yah_scopes, PrincipalId};
 use cheers_verify::PasetoV4PublicVerifier;
 use pasetors::keys::{AsymmetricKeyPair, Generate};
 use pasetors::version4::{PublicToken, V4};
@@ -41,7 +41,7 @@ fn mint_valid(kp: &AsymmetricKeyPair<V4>) -> String {
         0,
         4_000_000_000, // exp far in the future
         "jti-1",
-        vec![Scope::CloudRead],
+        vec![yah_scopes::CLOUD_READ],
     );
     let payload = serde_json::to_vec(&claims).expect("serialize claims");
     let footer = format!(r#"{{"kid":"{KID}"}}"#).into_bytes();
