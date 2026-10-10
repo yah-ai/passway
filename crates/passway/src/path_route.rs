@@ -85,6 +85,9 @@ pub struct MountSource {
     /// this mount served, never to a sibling mount's (R870-F15: "header
     /// ownership follows whoever matches the path").
     pub headers: Vec<(String, String)>,
+    /// Origins this mount grants cross-origin reads to (R826), owned on the
+    /// same terms as `headers`. See [`crate::cors`].
+    pub cors_origins: Vec<String>,
 }
 
 impl MountSource {
@@ -94,6 +97,7 @@ impl MountSource {
             source,
             opts: None,
             headers: Vec::new(),
+            cors_origins: Vec::new(),
         }
     }
 
@@ -106,6 +110,11 @@ impl MountSource {
         self.headers = headers;
         self
     }
+
+    pub fn with_cors_origins(mut self, cors_origins: Vec<String>) -> Self {
+        self.cors_origins = cors_origins;
+        self
+    }
 }
 
 /// One mount as the router holds it.
@@ -113,6 +122,7 @@ pub struct PathRoute {
     pub mount: String,
     pub upstream: HostUpstream,
     pub headers: Vec<(String, String)>,
+    pub cors_origins: Vec<String>,
 }
 
 /// Why [`PathRouter::new`] refused a table — refusing beats silently picking
@@ -299,6 +309,7 @@ pub fn build_path_router(
         source,
         opts,
         headers,
+        cors_origins,
     } in sources
     {
         let lb = build_load_balancer(source, health_check_frequency, update_frequency);
@@ -313,6 +324,7 @@ pub fn build_path_router(
             mount,
             upstream,
             headers,
+            cors_origins,
         });
         services.push(service);
     }
@@ -438,11 +450,13 @@ mod tests {
                 mount: "/app".into(),
                 upstream: HostUpstream::new(Arc::new(LoadBalancer::try_from_iter(["127.0.0.1:1"]).unwrap())),
                 headers: vec![],
+                cors_origins: vec![],
             },
             PathRoute {
                 mount: "/app".into(),
                 upstream: HostUpstream::new(Arc::new(LoadBalancer::try_from_iter(["127.0.0.1:2"]).unwrap())),
                 headers: vec![],
+                cors_origins: vec![],
             },
         ])
         .unwrap_err();
@@ -456,6 +470,7 @@ mod tests {
                 mount: bad.into(),
                 upstream: HostUpstream::new(Arc::new(LoadBalancer::try_from_iter(["127.0.0.1:1"]).unwrap())),
                 headers: vec![],
+                cors_origins: vec![],
             }])
             .unwrap_err();
             assert!(
@@ -473,6 +488,7 @@ mod tests {
                 mount: mount.into(),
                 upstream: HostUpstream::new(Arc::new(LoadBalancer::try_from_iter(["127.0.0.1:1"]).unwrap())),
                 headers: vec![],
+                cors_origins: vec![],
             }]);
             assert!(ok.is_ok(), "expected {good:?} to be accepted, got {ok:?}");
         }

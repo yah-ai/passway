@@ -129,6 +129,60 @@ async fn route_headers_apply_only_to_their_own_mount() {
     );
 }
 
+/// R826 end to end: a mount's `cors_origins` echoes each listed `Origin`, grants
+/// nothing to an unlisted one or to a request with none, varies on `Origin` in
+/// all three cases, and leaves a sibling mount alone.
+#[tokio::test]
+async fn cors_origins_echo_only_listed_origins_and_always_vary() {
+    let addr_root = common::spawn_fake_upstream("site-bundle").await;
+    let addr_app = common::spawn_fake_upstream("app-bundle").await;
+
+    let (proxy, lb_backgrounds) = common::build_path_routed_proxy_from(vec![
+        common::static_mount("", vec![addr_root]),
+        common::static_mount("/app", vec![addr_app]).with_cors_origins(vec![
+            "https://noisetable.com".into(),
+            "https://staging.noisetable.com".into(),
+        ]),
+    ]);
+    let listen = common::free_addr();
+    common::start_proxy_multi(proxy, lb_backgrounds, listen);
+    wait_until_ready(listen, 2).await;
+
+    let get_from = |path: &'static str, origin: Option<&'static str>| async move {
+        let origin = origin
+            .map(|o| format!("Origin: {o}\r\n"))
+            .unwrap_or_default();
+        let (_, raw) = common::send_raw_full(
+            listen,
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: noisetable.test\r\n{origin}Connection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        raw.split("\r\n\r\n").next().unwrap_or_default().to_lowercase()
+    };
+
+    for origin in ["https://noisetable.com", "https://staging.noisetable.com"] {
+        let head = get_from("/app/bundle.wasm", Some(origin)).await;
+        assert!(
+            head.contains(&format!("access-control-allow-origin: {origin}")),
+            "{origin}: {head}"
+        );
+        assert!(head.contains("vary: origin"), "{origin}: {head}");
+    }
+    for origin in [Some("https://evil.example"), None] {
+        let head = get_from("/app/bundle.wasm", origin).await;
+        assert!(!head.contains("access-control-allow-origin"), "{origin:?}: {head}");
+        assert!(head.contains("vary: origin"), "{origin:?}: {head}");
+    }
+    let root = get_from("/", Some("https://noisetable.com")).await;
+    assert!(
+        !root.contains("access-control-allow-origin") && !root.contains("vary: origin"),
+        "root mount must not inherit /app's CORS list: {root}"
+    );
+}
+
 /// A path matching no configured mount is 503 — the same fail-ready answer
 /// as an unmatched host, never a distinct 404 that would let a prober tell
 /// "wrong mount" apart from "backend down".

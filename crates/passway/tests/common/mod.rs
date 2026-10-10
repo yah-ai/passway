@@ -232,18 +232,36 @@ pub fn build_path_routed_proxy(mounts: Vec<MountConfig>) -> (
         >,
     >,
 ) {
-    let sources: Vec<MountSource> = mounts
-        .into_iter()
-        .map(|(mount, addrs, headers)| {
-            MountSource::new(mount, Arc::new(StaticUpstreams::new(addrs)) as Arc<dyn UpstreamSource>)
-                .with_headers(
+    build_path_routed_proxy_from(
+        mounts
+            .into_iter()
+            .map(|(mount, addrs, headers)| {
+                static_mount(mount, addrs).with_headers(
                     headers
                         .into_iter()
                         .map(|(k, v)| (k.to_string(), v.to_string()))
                         .collect(),
                 )
-        })
-        .collect();
+            })
+            .collect(),
+    )
+}
+
+/// A mount served by a fixed address list, for [`build_path_routed_proxy_from`].
+pub fn static_mount(mount: &str, addrs: Vec<SocketAddr>) -> MountSource {
+    MountSource::new(mount, Arc::new(StaticUpstreams::new(addrs)) as Arc<dyn UpstreamSource>)
+}
+
+/// [`build_path_routed_proxy`] over ready-made [`MountSource`]s, for a mount
+/// property the tuple shape does not carry (R826's `cors_origins`).
+pub fn build_path_routed_proxy_from(sources: Vec<MountSource>) -> (
+    PassProxy,
+    Vec<
+        pingora::services::background::GenBackgroundService<
+            pingora::lb::LoadBalancer<pingora::lb::selection::RoundRobin>,
+        >,
+    >,
+) {
     let (router, services) = build_path_router(
         sources,
         Duration::from_millis(100),

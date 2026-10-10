@@ -304,6 +304,23 @@ async fn a_door_pointed_at_an_unreadable_table_refuses_to_start() {
     );
 }
 
+/// R876-B20: the self-description yubaba probes before writing a table. Run
+/// with an EMPTY environment, which is how the producer runs it: the answer
+/// must not depend on any door configuration.
+#[tokio::test]
+async fn the_binary_names_the_route_schemas_it_reads_and_exits() {
+    let out = tokio::process::Command::new(PathBuf::from(env!("CARGO_BIN_EXE_passway")))
+        .arg(passway::path_routes_file::SCHEMAS_FLAG)
+        .env_clear()
+        .output();
+    let out = tokio::time::timeout(Duration::from_secs(30), out)
+        .await
+        .expect("the schemas flag must exit, not serve")
+        .expect("run passway --path-routes-schemas");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "path-routes-schemas 1 2\n");
+}
+
 // ── R870-F23: the cleartext inner door ───────────────────────────────────────
 
 /// Fork a real `passway` in `PASSWAY_TLS_MODE=plaintext`. Deliberately NOT a

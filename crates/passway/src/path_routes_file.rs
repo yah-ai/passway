@@ -49,10 +49,25 @@
 //! The producer (yah's control plane) and the consumer (this binary) are
 //! separately released and a rolling upgrade genuinely sees two versions at
 //! once — the one case `CLAUDE.md`'s "below v1.0.0" rule tells you to
-//! sequence for. So the version is *required* and anything but
-//! [`SCHEMA_VERSION`] is a boot failure naming both numbers. It buys a loud
-//! failure, never a fallback path: there is exactly one supported shape at a
-//! time and no code here reads an older one.
+//! sequence for. So the version is *required* and anything outside
+//! [`SCHEMA_VERSIONS`] is a boot failure naming both the file's number and
+//! the set this binary reads.
+//!
+//! ## Which versions this binary reads (R876-B20)
+//!
+//! - **1** — `upstreams` mounts; and `discover` mounts too, because that is
+//!   what is in the field: yubaba 0.8.43–0.8.45 wrote `discover` under
+//!   version 1 onto live nodes. A consumer reads everything producers in the
+//!   field have written, so shipping this passway alone never crash-loops a
+//!   door that is serving the file already on disk.
+//! - **2** — mounts may name `discover`. Producers write 2 only when a mount
+//!   discovers, and write 1 otherwise, so every passway ever shipped reads
+//!   whatever they can.
+//!
+//! One struct parses both: the shapes differ only in what a producer is
+//! allowed to emit, not in what a reader has to do. A producer learns this set
+//! by running the binary with [`SCHEMAS_FLAG`] before it writes a table, and
+//! refuses to write one the installed binary cannot read.
 //!
 //! ## What this module does NOT validate
 //!
@@ -107,9 +122,23 @@ const DISCOVER_CACHE_MAX_AGE: Duration = Duration::from_secs(300);
 /// before R870-T18.
 pub const ROUTES_FILE_ENV: &str = "PASSWAY_PATH_ROUTES_FILE";
 
-/// The only `schema_version` this binary reads. See the module doc for why a
-/// mismatch is a boot failure rather than a fallback.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Every `schema_version` this binary reads (R876-B20). Anything else is a
+/// boot failure naming both the file's number and this set — see the module
+/// doc's "Which versions this binary reads".
+pub const SCHEMA_VERSIONS: &[u32] = &[1, 2];
+
+/// The CLI flag a producer runs to learn [`SCHEMA_VERSIONS`] before writing a
+/// table (R876-B20). Prints [`schemas_line`] and exits 0 without starting
+/// anything.
+pub const SCHEMAS_FLAG: &str = "--path-routes-schemas";
+
+/// What [`SCHEMAS_FLAG`] prints: `path-routes-schemas 1 2`. One line, a fixed
+/// leading token so a producer can tell this answer from any other output an
+/// older binary might emit, then the versions space-separated.
+pub fn schemas_line() -> String {
+    let versions: Vec<String> = SCHEMA_VERSIONS.iter().map(u32::to_string).collect();
+    format!("path-routes-schemas {}", versions.join(" "))
+}
 
 /// Why a route table was refused. One error type for read + parse +
 /// validation, because every one of them is the same operator-facing event:
@@ -173,6 +202,11 @@ pub struct PathRouteEntry {
     /// `PassProxy::response_filter`).
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// Origins this mount grants cross-origin reads to (R826) — the domain
+    /// manifest's `cors_origins`, applied with `headers` and only to responses
+    /// this mount served. See [`crate::cors`].
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
 }
 
 impl PathRoutesFile {
@@ -181,9 +215,9 @@ impl PathRoutesFile {
     pub fn parse(src: &str) -> Result<Self, PathRoutesError> {
         let file: PathRoutesFile = serde_json::from_str(src)
             .map_err(|e| PathRoutesError(format!("not a valid path-routes file: {e}")))?;
-        if file.schema_version != SCHEMA_VERSION {
+        if !SCHEMA_VERSIONS.contains(&file.schema_version) {
             return Err(PathRoutesError(format!(
-                "unsupported schema_version {}: this passway reads version {SCHEMA_VERSION} only. \
+                "unsupported schema_version {}: this passway reads versions {SCHEMA_VERSIONS:?}. \
                  The generator that wrote this table and this binary are separately released — \
                  roll one of them, do not hand-edit the version",
                 file.schema_version
@@ -222,6 +256,8 @@ impl PathRoutesFile {
                 }
                 _ => {}
             }
+            crate::cors::refuse_wildcards(&route.cors_origins)
+                .map_err(|e| PathRoutesError(format!("mount {:?}: {e}", route.mount)))?;
         }
         Ok(file)
     }
@@ -261,7 +297,8 @@ impl PathRoutesFile {
                         route.mount,
                         Arc::new(YubabaUpstreams::new(&config)) as Arc<dyn UpstreamSource>,
                     )
-                    .with_headers(route.headers.into_iter().collect()));
+                    .with_headers(route.headers.into_iter().collect())
+                    .with_cors_origins(route.cors_origins));
                 }
                 let addrs = route
                     .upstreams
@@ -279,7 +316,8 @@ impl PathRoutesFile {
                     route.mount,
                     Arc::new(StaticUpstreams::new(addrs)) as Arc<dyn UpstreamSource>,
                 )
-                .with_headers(route.headers.into_iter().collect()))
+                .with_headers(route.headers.into_iter().collect())
+                .with_cors_origins(route.cors_origins))
             })
             .collect()
     }
@@ -369,6 +407,31 @@ mod tests {
         );
     }
 
+    /// R826: a mount's `cors_origins` reaches its `MountSource`, and the two
+    /// entries whose meaning would change rather than fail to match are refused.
+    #[test]
+    fn cors_origins_travel_to_the_mount_and_wildcards_are_refused() {
+        let sources = PathRoutesFile::parse(
+            r#"{"schema_version":1,"routes":[
+                {"mount":"","upstreams":["127.0.0.1:8081"]},
+                {"mount":"/app","upstreams":["127.0.0.1:8082"],
+                 "cors_origins":["https://noisetable.com"]}]}"#,
+        )
+        .expect("valid table")
+        .into_mount_sources(None, &yubaba_auth_token::PeerSigner::unsigned())
+        .expect("resolvable addresses");
+        assert!(sources[0].cors_origins.is_empty());
+        assert_eq!(sources[1].cors_origins, vec!["https://noisetable.com".to_string()]);
+
+        for bad in ["*", "null"] {
+            let err = PathRoutesFile::parse(&format!(
+                r#"{{"schema_version":1,"routes":[{{"mount":"","upstreams":["127.0.0.1:8081"],"cors_origins":["{bad}"]}}]}}"#
+            ))
+            .unwrap_err();
+            assert!(err.0.contains(bad), "{bad}: {}", err.0);
+        }
+    }
+
     /// The end-to-end config path this module exists for: file bytes in, a
     /// validated router out, with the mount the request will actually match.
     #[test]
@@ -391,9 +454,27 @@ mod tests {
 
     #[test]
     fn a_wrong_schema_version_is_refused_and_names_both_numbers() {
-        let err = PathRoutesFile::parse(r#"{"schema_version": 2, "routes": []}"#).unwrap_err();
-        assert!(err.to_string().contains("unsupported schema_version 2"), "{err}");
-        assert!(err.to_string().contains("version 1 only"), "{err}");
+        let err = PathRoutesFile::parse(r#"{"schema_version": 3, "routes": []}"#).unwrap_err();
+        assert!(err.to_string().contains("unsupported schema_version 3"), "{err}");
+        assert!(err.to_string().contains("reads versions [1, 2]"), "{err}");
+    }
+
+    /// R876-B20: v1 with and without `discover` (the former is what yubaba
+    /// 0.8.43–0.8.45 left on live nodes) and v2 all parse.
+    #[test]
+    fn every_schema_producers_in_the_field_write_parses() {
+        let fixed = r#"{"routes":[{"mount":"","upstreams":["127.0.0.1:8081"]}],"schema_version":"#;
+        let disc = r#"{"routes":[{"mount":"","discover":{"ident":"x","yubaba":["http://y:7443"]}}],"schema_version":"#;
+        for (body, v) in [(fixed, 1), (disc, 1), (fixed, 2), (disc, 2)] {
+            let file = PathRoutesFile::parse(&format!("{body}{v}}}"))
+                .unwrap_or_else(|e| panic!("v{v} {body}: {e}"));
+            assert_eq!(file.schema_version, v);
+        }
+    }
+
+    #[test]
+    fn the_schemas_line_names_every_version_this_binary_reads() {
+        assert_eq!(schemas_line(), "path-routes-schemas 1 2");
     }
 
     #[test]

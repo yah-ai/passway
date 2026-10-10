@@ -351,6 +351,199 @@ impl PeerSigner {
     }
 }
 
+/// Attaches a freshly minted OPERATOR-tier token to outbound requests — the
+/// operator twin of [`PeerSigner`] (R876-T21).
+///
+/// Mints per request rather than caching one token, so nothing a long-lived
+/// process (the desktop, a camp daemon) holds can outlive
+/// [`MAX_TOKEN_TTL_SECS`]: `mint_operator_token` is pure and cheap.
+#[derive(Clone, Default)]
+pub struct OperatorSigner {
+    mint: Option<Arc<MintFn>>,
+    subject: Option<String>,
+}
+
+impl std::fmt::Debug for OperatorSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperatorSigner")
+            .field("signing", &self.mint.is_some())
+            .field("subject", &self.subject)
+            .finish()
+    }
+}
+
+impl OperatorSigner {
+    /// A signer that attaches nothing — an operator with no key file. Byte-
+    /// identical on the wire to a client from before operator signing.
+    pub fn unsigned() -> Self {
+        Self::default()
+    }
+
+    /// Mint operator tokens for `subject` under `secret`,
+    /// [`DEFAULT_TOKEN_TTL_SECS`] each.
+    pub fn for_secret(secret: AsymmetricSecretKey<V4>, subject: String) -> Self {
+        let sub = subject.clone();
+        Self {
+            mint: Some(Arc::new(move || {
+                mint_operator_token(&secret, &sub, DEFAULT_TOKEN_TTL_SECS, now_unix())
+            })),
+            subject: Some(subject),
+        }
+    }
+
+    /// Read the hex operator secret at `path` (as written by `yubaba auth
+    /// keygen --secret-out`) and sign as `subject`.
+    ///
+    /// Unreadable, malformed, or — on unix — group/world-accessible is an
+    /// `Err` naming the path, never a fall back to unsigned: a key the rest
+    /// of the box can read is not a key, and a silent unsigned fallback would
+    /// surface only as a 401 once the fleet enforces.
+    pub fn from_key_file(path: &Path, subject: String) -> Result<Self, String> {
+        Ok(Self::for_secret(read_operator_key_file(path)?, subject))
+    }
+
+    /// Does this signer attach a credential at all?
+    pub fn is_signing(&self) -> bool {
+        self.mint.is_some()
+    }
+
+    /// The `sub` this signer mints for, when signing.
+    pub fn subject(&self) -> Option<&str> {
+        self.subject.as_deref()
+    }
+
+    /// The `Authorization` value for one request, if this signer has a key.
+    /// A mint failure degrades to unsigned with a WARN, as [`PeerSigner::bearer`].
+    pub fn bearer(&self) -> Option<String> {
+        let mint = self.mint.as_ref()?;
+        match mint() {
+            Ok(token) => Some(format!("Bearer {token}")),
+            Err(e) => {
+                tracing::warn!(error = %e, "minting an operator token failed; sending this request unsigned");
+                None
+            }
+        }
+    }
+
+    /// Attach a fresh token to `rb`, or return it untouched when unsigned.
+    pub fn sign(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.bearer() {
+            Some(value) => rb.header(reqwest::header::AUTHORIZATION, value),
+            None => rb,
+        }
+    }
+}
+
+/// Env naming the operator secret key file (R876-T21). Read by cloud-client
+/// and by yubaba's own client verbs (`yubaba raft ...`).
+pub const OPERATOR_KEY_FILE_ENV: &str = "YAH_OPERATOR_KEY_FILE";
+
+/// The operator secret's file name under `$YAH_HOME` (default `~/.yah`).
+/// Create it with `yubaba auth keygen --secret-out ~/.yah/operator.key`.
+pub const OPERATOR_KEY_FILE_NAME: &str = "operator.key";
+
+/// Where the operator's key file is expected: `$YAH_OPERATOR_KEY_FILE`, else
+/// `$YAH_HOME/operator.key`, else `~/.yah/operator.key`. `None` only when
+/// none of those env vars is set. Says nothing about whether it exists.
+pub fn default_operator_key_file() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if let Some(p) = std::env::var_os(OPERATOR_KEY_FILE_ENV).filter(|p| !p.is_empty()) {
+        return Some(PathBuf::from(p));
+    }
+    let home = match std::env::var_os("YAH_HOME").filter(|p| !p.is_empty()) {
+        Some(p) => PathBuf::from(p),
+        None => PathBuf::from(std::env::var_os("HOME")?).join(".yah"),
+    };
+    Some(home.join(OPERATOR_KEY_FILE_NAME))
+}
+
+/// Read an operator secret key file: unix mode must have no group/world bits,
+/// contents must be the 128-hex v4 secret. Every error names the path.
+pub fn read_operator_key_file(path: &Path) -> Result<AsymmetricSecretKey<V4>, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path)
+            .map_err(|e| format!("operator key file {}: {e}", path.display()))?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "operator key file {} is mode {mode:04o}; it must not be group/world-accessible (chmod 600 it)",
+                path.display()
+            ));
+        }
+    }
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("reading operator key file {}: {e}", path.display()))?;
+    operator_secret_from_hex(&raw).map_err(|e| format!("operator key file {}: {e}", path.display()))
+}
+
+/// R876-T23: the PUBLIC hex (the `YUBABA_OPERATOR_KEYS` spelling) of an
+/// operator secret. A v4 secret is 64 bytes, seed then public key.
+pub fn operator_public_hex(secret: &AsymmetricSecretKey<V4>) -> String {
+    encode_hex(&secret.as_bytes()[32..])
+}
+
+/// R876-T23: the public hex of the operator key at
+/// [`default_operator_key_file`], for a locally spawned yubaba to trust.
+/// `Ok(None)` when no key file exists (nothing changes); `Err` names the path.
+pub fn default_operator_public_hex() -> Result<Option<String>, String> {
+    match default_operator_key_file() {
+        Some(path) => operator_public_hex_for_optional_file(&path),
+        None => Ok(None),
+    }
+}
+
+/// [`default_operator_public_hex`] for an explicit path: `Ok(None)` when the
+/// file does not exist.
+pub fn operator_public_hex_for_optional_file(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        _ => Ok(Some(operator_public_hex(&read_operator_key_file(path)?))),
+    }
+}
+
+/// The signer for [`default_operator_key_file`]: unsigned when absent.
+pub fn default_operator_signer() -> Result<OperatorSigner, String> {
+    match default_operator_key_file() {
+        Some(path) => operator_signer_for_optional_file(&path),
+        None => Ok(OperatorSigner::unsigned()),
+    }
+}
+
+/// Env giving an operator token's `sub` verbatim, e.g. `svc:yah-cloud-admin`
+/// (R876-T22). Wins over `user:$USER`.
+pub const OPERATOR_SUBJECT_ENV: &str = "YAH_OPERATOR_SUBJECT";
+
+/// `$YAH_OPERATOR_SUBJECT`, else `user:$USER`, else `user:$LOGNAME`; blank
+/// values skipped. `None` is the caller's hard error — never an empty or
+/// placeholder subject. `env` is injected so tests need no process env.
+pub fn operator_subject(env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let get = |k: &str| env(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    get(OPERATOR_SUBJECT_ENV)
+        .or_else(|| get("USER").map(|u| format!("user:{u}")))
+        .or_else(|| get("LOGNAME").map(|u| format!("user:{u}")))
+}
+
+/// The operator signer for a key file that may not exist: absent means
+/// [`OperatorSigner::unsigned`]; present means signing as
+/// [`operator_subject`] from the process env, and any problem — no subject,
+/// bad mode, bad hex — is an `Err` naming the path.
+pub fn operator_signer_for_optional_file(path: &Path) -> Result<OperatorSigner, String> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(OperatorSigner::unsigned()),
+        _ => {
+            let subject = operator_subject(|k| std::env::var(k).ok()).ok_or_else(|| {
+                format!(
+                    "operator key file {} exists but no subject resolves: set {OPERATOR_SUBJECT_ENV} (a container usually has no $USER)",
+                    path.display()
+                )
+            })?;
+            OperatorSigner::from_key_file(path, subject)
+        }
+    }
+}
+
 /// A [`reqwest::Client`] whose every request carries a peer token.
 ///
 /// The type exists so that "this client dials yubaba peer routes" is something
@@ -401,6 +594,16 @@ mod tests {
     use super::*;
     use pasetors::token::{Local, UntrustedToken};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// R876-T23: the public half derived from a secret is the one keygen
+    /// printed, so a node trusting it verifies tokens that secret mints.
+    #[test]
+    fn the_public_hex_derived_from_a_secret_matches_keygen() {
+        let (public, secret) = generate_operator_keypair_hex().unwrap();
+        let sk = operator_secret_from_hex(&secret).unwrap();
+        assert_eq!(operator_public_hex(&sk), public);
+        operator_public_from_hex(&operator_public_hex(&sk)).unwrap();
+    }
 
     #[test]
     fn an_unsigned_signer_attaches_nothing() {

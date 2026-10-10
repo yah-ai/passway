@@ -99,6 +99,7 @@
 
 pub mod acme;
 pub mod auth;
+pub mod cors;
 pub mod discovery;
 pub mod hardening;
 pub mod health;

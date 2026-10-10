@@ -1255,6 +1255,14 @@ fn build_auth() -> Option<(CheersAuth, RouteAuthPolicy)> {
 }
 
 fn main() {
+    // R876-B20: the one argv this binary reads. A producer (yubaba) runs it to
+    // learn which path-routes schemas it may write; answer and exit before
+    // anything — logging, TLS, a listener — starts.
+    if std::env::args().nth(1).as_deref() == Some(passway::path_routes_file::SCHEMAS_FLAG) {
+        println!("{}", passway::path_routes_file::schemas_line());
+        return;
+    }
+
     // rustls 0.23 requires a process-level CryptoProvider before the first
     // TLS use, and this dependency graph enables both `ring` (instant-acme's
     // pin, see Cargo.toml) and `aws-lc-rs` (rustls's own default via

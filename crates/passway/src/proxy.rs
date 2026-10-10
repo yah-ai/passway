@@ -79,6 +79,7 @@ use pingora::upstreams::peer::HttpPeer;
 use pingora::{Error, ErrorType, Result as PResult};
 
 use crate::auth::{self, CheersAuth, RouteAuthPolicy};
+use crate::cors::CorsVerdict;
 use crate::hardening;
 use crate::health::{HostReadiness, ReadinessBody};
 use crate::holding;
@@ -117,6 +118,9 @@ pub struct RequestCtx {
     upstreams: Option<Arc<LoadBalancer<RoundRobin>>>,
     upstream_opts: Option<UpstreamOpts>,
     route_headers: Vec<(String, String)>,
+    /// R826: the matched mount's `cors_origins`, already decided against this
+    /// request's `Origin`, applied beside `route_headers` in `response_filter`.
+    cors: CorsVerdict,
     trace: Option<trace::RequestTrace>,
     /// R936-B1: how many front doors this request had already crossed when it
     /// arrived ([`crate::owner::DOOR_HOP_HEADER`]).
@@ -193,7 +197,12 @@ impl RoutingStrategy {
             // it reports no `http.route` (R893-F16) — substituting the raw path
             // would be a high-cardinality key in a low-cardinality slot.
             RoutingStrategy::ByHost(r) => match r.resolve(host) {
-                Some(u) => RouteOutcome::Found { upstream: u, headers: &[], route: None },
+                Some(u) => RouteOutcome::Found {
+                    upstream: u,
+                    headers: &[],
+                    cors_origins: &[],
+                    route: None,
+                },
                 None => RouteOutcome::NoRoute,
             },
             RoutingStrategy::ByPath(p) => {
@@ -206,6 +215,7 @@ impl RoutingStrategy {
                     Some(route) => RouteOutcome::Found {
                         upstream: &route.upstream,
                         headers: &route.headers,
+                        cors_origins: &route.cors_origins,
                         route: Some(&route.mount),
                     },
                     None => RouteOutcome::NoRoute,
@@ -223,6 +233,9 @@ enum RouteOutcome<'a> {
     Found {
         upstream: &'a HostUpstream,
         headers: &'a [(String, String)],
+        /// R826: the matched mount's CORS allowlist; empty on a host-routed
+        /// door, like `headers`.
+        cors_origins: &'a [String],
         /// R893-F16: the matched MOUNT on a path-routed door, which is a
         /// low-cardinality `http.route`. `None` on a host-routed door.
         route: Option<&'a str>,
@@ -536,9 +549,15 @@ impl ProxyHttp for PassProxy {
         // (U+FFFD-substituted) view of a non-UTF-8 path while the real bytes
         // still reach the upstream (adversarial-review FIX 2). `raw_path()`
         // returns path-and-query, so `path_only` strips the query.
-        let (path_bytes, has_conflict, bearer, host, wants_html, traced) = {
+        let (path_bytes, has_conflict, bearer, host, wants_html, traced, origin) = {
             let req = session.req_header();
             ctx.door_hop = crate::owner::arrival_door_hop(&req.headers);
+            // R826: decided against the matched mount's list once it is known.
+            let origin = req
+                .headers
+                .get(http::header::ORIGIN)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
             let path_bytes = path_only(req.raw_path()).to_vec();
             let has_conflict = hardening::has_conflicting_length_headers(&req.headers);
             let bearer = auth::bearer_from_headers(&req.headers).map(str::to_owned);
@@ -560,7 +579,7 @@ impl ProxyHttp for PassProxy {
                     &String::from_utf8_lossy(&path_bytes),
                 )
             });
-            (path_bytes, has_conflict, bearer, host, wants_html, traced)
+            (path_bytes, has_conflict, bearer, host, wants_html, traced, origin)
         };
         ctx.trace = traced;
         if let Some(t) = ctx.trace.as_mut() {
@@ -713,11 +732,16 @@ impl ProxyHttp for PassProxy {
         // must stay indistinguishable to anyone probing which tenants exist.
         // Resolved inside the branches rather than above them because the
         // overwhelming majority of requests take neither.
-        let (upstream, route_headers, route) = match self
+        let (upstream, route_headers, cors_origins, route) = match self
             .routing
             .resolve(host.as_deref(), canonical.as_deref())
         {
-            RouteOutcome::Found { upstream, headers, route } => (upstream, headers, route),
+            RouteOutcome::Found {
+                upstream,
+                headers,
+                cors_origins,
+                route,
+            } => (upstream, headers, cors_origins, route),
             RouteOutcome::NoRoute => {
                 let page = self.holding_page_for(host.as_deref());
                 respond_unavailable(session, wants_html, page.as_deref()).await?;
@@ -749,6 +773,7 @@ impl ProxyHttp for PassProxy {
 
         ctx.upstreams = Some(Arc::clone(&upstream.lb));
         ctx.route_headers = route_headers.to_vec();
+        ctx.cors = CorsVerdict::decide(cors_origins, origin.as_deref());
         // Resolved here, against the set that just passed the readiness gate,
         // rather than in `upstream_peer` — same reason the balancer itself is
         // threaded through the ctx (R858-T1).
@@ -874,6 +899,9 @@ impl ProxyHttp for PassProxy {
         for (name, value) in &ctx.route_headers {
             upstream_response.insert_header(name.clone(), value.clone())?;
         }
+        // R826: after the literal headers, so the declared list — not a stale
+        // literal or the upstream's own grant — has the last word on ACAO.
+        ctx.cors.apply(upstream_response)?;
         // R893-F16: the CLIENT span closes here — upstream-header-arrival is
         // exactly the boundary it measures. The SERVER span does not; it closes
         // in `logging`, which also sees the requests that never got this far.
