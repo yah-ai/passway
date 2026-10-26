@@ -22,7 +22,11 @@ path = "src/lib.rs"
 # principal), so the graph carries one copy.
 pasetors = { version = "0.7", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# R975-F14: raw ed25519 for delegation.rs. Already in the graph under pasetors
+# (same 2.x), so this adds no new copy.
+ed25519-compact = "2"
 # `log`: passway logs through `log`/env_logger and installs no tracing
 # subscriber, so without this a mint failure there would warn into nothing.
 tracing = { version = "0.1", features = ["log"] }

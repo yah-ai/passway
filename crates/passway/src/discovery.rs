@@ -178,25 +178,25 @@ use crate::upstream::UpstreamSource;
 /// rather than shared.
 pub const DISCOVERY_PATH: &str = "/service-records";
 
-/// R876-T18: path to the yubaba cluster-key file (hex — the same file yubaba's
-/// `--cluster-key-file` names). Set, and every call this process makes to
-/// yubaba carries a peer token minted under it; unset, they go unsigned, which
-/// a `warn`-mode yubaba serves and a `require`-mode one 401s. A path rather than
-/// the key: the key is a bearer secret for the whole cluster.
-pub const CLUSTER_KEY_FILE_ENV: &str = "PASSWAY_YUBABA_CLUSTER_KEY_FILE";
+/// R997-B26: path to the yubaba SERVICE-key file (hex — the same file yubaba's
+/// `--service-key-file` names). Set, and every call this process makes to
+/// yubaba carries a service-tier token minted under it, which opens only the
+/// discovery reads; unset, they go unsigned and a `require`-mode yubaba 401s.
+/// A door never holds the cluster key.
+pub const SERVICE_KEY_FILE_ENV: &str = "PASSWAY_YUBABA_SERVICE_KEY_FILE";
 
 /// The signer for this process's yubaba calls, from the raw value of
-/// [`CLUSTER_KEY_FILE_ENV`]. A named file that cannot be read or parsed is an
+/// [`SERVICE_KEY_FILE_ENV`]. A named file that cannot be read or parsed is an
 /// `Err` (a boot failure) rather than a quiet fall back to unsigned: that
 /// fallback would only surface once the fleet enforces, as a door that cannot
 /// see its backends.
 pub fn yubaba_peer_signer(key_file: Option<&str>) -> Result<PeerSigner, String> {
     let path = key_file.map(str::trim).filter(|p| !p.is_empty()).map(Path::new);
-    let signer = PeerSigner::from_key_file(path, "svc:passway".to_string())
-        .map_err(|e| format!("{CLUSTER_KEY_FILE_ENV}: {e}"))?;
+    let signer = PeerSigner::from_service_key_file(path, "svc:passway".to_string())
+        .map_err(|e| format!("{SERVICE_KEY_FILE_ENV}: {e}"))?;
     if !signer.is_signing() {
         log::warn!(
-            "{CLUSTER_KEY_FILE_ENV} is unset: yubaba polls go unsigned and will 401 once yubaba \
+            "{SERVICE_KEY_FILE_ENV} is unset: yubaba polls go unsigned and will 401 once yubaba \
              runs --auth-mode require"
         );
     }

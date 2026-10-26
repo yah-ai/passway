@@ -35,6 +35,9 @@
 //! can see. The roll order in R876-T18 (keys everywhere, then flip) is what
 //! keeps that second case from happening on the fleet.
 
+pub mod delegation;
+pub mod node_identity;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -59,6 +62,21 @@ pub const OPERATOR_SCOPE: &str = "yubaba:operator";
 
 /// `scope` entry a peer-tier token must carry.
 pub const PEER_SCOPE: &str = "yubaba:peer";
+
+/// `scope` entry a service-tier token must carry (R997-B26).
+///
+/// The service tier is for out-of-process callers that poll discovery or hold
+/// a tenant lease — doors, the issue-tracker receiver, tenant-streamer. It is
+/// minted under a SEPARATE symmetric key, so holding it confers no peer or
+/// operator standing: a node opens only its narrow service routes to it.
+pub const SERVICE_SCOPE: &str = "yubaba:service";
+
+/// The env var naming the service-key FILE on a node (R997-B26). The file is
+/// the hex symmetric key callers in [`SERVICE_SCOPE`] mint under.
+pub const SERVICE_KEY_FILE_ENV: &str = "YUBABA_SERVICE_KEY_FILE";
+
+/// Where provisioning installs the service key on a node.
+pub const DEFAULT_SERVICE_KEY_PATH: &str = "/etc/yah-cloud/service.key";
 
 /// Default lifetime for a freshly minted token.
 pub const DEFAULT_TOKEN_TTL_SECS: i64 = 300;
@@ -164,6 +182,18 @@ pub fn mint_peer_token(
     let payload = claims_json(subject, PEER_SCOPE, ttl_secs, now)?;
     LocalToken::encrypt(key, payload.as_bytes(), None, None)
         .map_err(|e| format!("encrypting peer token: {e:?}"))
+}
+
+/// Mint a service-tier token under the service key (R997-B26).
+pub fn mint_service_token(
+    key: &SymmetricKey<V4>,
+    subject: &str,
+    ttl_secs: i64,
+    now: i64,
+) -> Result<String, String> {
+    let payload = claims_json(subject, SERVICE_SCOPE, ttl_secs, now)?;
+    LocalToken::encrypt(key, payload.as_bytes(), None, None)
+        .map_err(|e| format!("encrypting service token: {e:?}"))
 }
 
 /// Seconds since the epoch — the `now` every mint and check takes.
@@ -278,12 +308,15 @@ type MintFn = dyn Fn() -> Result<String, String> + Send + Sync;
 #[derive(Clone, Default)]
 pub struct PeerSigner {
     mint: Option<Arc<MintFn>>,
+    /// R997-B27: who this caller is, proven on [`PeerClient::post_json_proved`].
+    identity: Option<Arc<node_identity::NodeIdentity>>,
 }
 
 impl std::fmt::Debug for PeerSigner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PeerSigner")
             .field("signing", &self.mint.is_some())
+            .field("identity", &self.identity)
             .finish()
     }
 }
@@ -291,14 +324,29 @@ impl std::fmt::Debug for PeerSigner {
 impl PeerSigner {
     /// A signer that attaches nothing — a caller with no cluster key.
     pub fn unsigned() -> Self {
-        Self { mint: None }
+        Self::default()
     }
 
     /// A signer that calls `mint` once per request.
     pub fn from_fn(mint: impl Fn() -> Result<String, String> + Send + Sync + 'static) -> Self {
         Self {
             mint: Some(Arc::new(mint)),
+            identity: None,
         }
+    }
+
+    /// Also prove `identity` (R997-B27) on every
+    /// [`PeerClient::post_json_proved`] request. `None` proves nothing.
+    pub fn with_node_identity(
+        mut self,
+        identity: Option<Arc<node_identity::NodeIdentity>>,
+    ) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    pub fn node_identity(&self) -> Option<&node_identity::NodeIdentity> {
+        self.identity.as_deref()
     }
 
     /// Mint peer tokens for `subject` under `key`, [`DEFAULT_TOKEN_TTL_SECS`]
@@ -316,6 +364,23 @@ impl PeerSigner {
     pub fn from_key_file(key_file: Option<&Path>, subject: String) -> Result<Self, String> {
         match key_file {
             Some(path) => Ok(Self::for_cluster_key(cluster_key_from_file(path)?, subject)),
+            None => Ok(Self::unsigned()),
+        }
+    }
+
+    /// Mint service-tier tokens for `subject` under the service key
+    /// (R997-B26), [`DEFAULT_TOKEN_TTL_SECS`] each.
+    pub fn for_service_key(key: SymmetricKey<V4>, subject: String) -> Self {
+        Self::from_fn(move || {
+            mint_service_token(&key, &subject, DEFAULT_TOKEN_TTL_SECS, now_unix())
+        })
+    }
+
+    /// [`Self::from_key_file`] for a service-key file: the signer doors,
+    /// the issue-tracker receiver and tenant-streamer build.
+    pub fn from_service_key_file(key_file: Option<&Path>, subject: String) -> Result<Self, String> {
+        match key_file {
+            Some(path) => Ok(Self::for_service_key(cluster_key_from_file(path)?, subject)),
             None => Ok(Self::unsigned()),
         }
     }
@@ -361,6 +426,9 @@ impl PeerSigner {
 pub struct OperatorSigner {
     mint: Option<Arc<MintFn>>,
     subject: Option<String>,
+    /// The key itself, for [`Self::attest_workload_spec`]. `None` exactly
+    /// when `mint` is.
+    secret: Option<Arc<AsymmetricSecretKey<V4>>>,
 }
 
 impl std::fmt::Debug for OperatorSigner {
@@ -383,11 +451,28 @@ impl OperatorSigner {
     /// [`DEFAULT_TOKEN_TTL_SECS`] each.
     pub fn for_secret(secret: AsymmetricSecretKey<V4>, subject: String) -> Self {
         let sub = subject.clone();
+        let secret = Arc::new(secret);
+        let mint_key = Arc::clone(&secret);
         Self {
             mint: Some(Arc::new(move || {
-                mint_operator_token(&secret, &sub, DEFAULT_TOKEN_TTL_SECS, now_unix())
+                mint_operator_token(&mint_key, &sub, DEFAULT_TOKEN_TTL_SECS, now_unix())
             })),
             subject: Some(subject),
+            secret: Some(secret),
+        }
+    }
+
+    /// R997-B11: the operator's signature over a deploy body's `spec`
+    /// ([`delegation::sign_workload_spec`]), or `None` when unsigned. Nodes
+    /// re-place a replicated spec only under this signature.
+    pub fn attest_workload_spec(&self, spec: &serde_json::Value) -> Option<String> {
+        let secret = self.secret.as_ref()?;
+        match delegation::sign_workload_spec(secret, spec) {
+            Ok(sig) => Some(sig),
+            Err(e) => {
+                tracing::warn!(error = %e, "signing a workload spec failed; deploying it unattested");
+                None
+            }
         }
     }
 
@@ -587,6 +672,28 @@ impl PeerClient {
     pub fn delete(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
         self.signer.sign(self.http.delete(url))
     }
+
+    /// POST `body` as JSON. When the signer carries a node identity
+    /// (R997-B27), the request also proves it over the exact bytes sent, so
+    /// the receiver can bind the request to the node it names.
+    pub fn post_json_proved<T: serde::Serialize + ?Sized>(
+        &self,
+        url: &str,
+        body: &T,
+    ) -> Result<reqwest::RequestBuilder, String> {
+        let bytes = serde_json::to_vec(body).map_err(|e| format!("serializing request body: {e}"))?;
+        let mut rb = self
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        if let Some(identity) = self.signer.identity.as_deref() {
+            let parsed = reqwest::Url::parse(url).map_err(|e| format!("{url}: {e}"))?;
+            rb = rb.header(
+                node_identity::NODE_PROOF_HEADER,
+                identity.prove("POST", parsed.path(), &bytes, now_unix()),
+            );
+        }
+        Ok(rb.body(bytes))
+    }
 }
 
 #[cfg(test)]
@@ -664,6 +771,25 @@ mod tests {
         assert!(validate_claims(trusted.payload(), OPERATOR_SCOPE, now_unix()).is_err());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R997-B26: a service token carries only the service scope, so it can
+    /// never pass as a peer token even when a verifier holds the same bytes.
+    #[test]
+    fn a_service_token_carries_the_service_scope_and_never_the_peer_scope() {
+        let hex = generate_cluster_key_hex().unwrap();
+        let key = cluster_key_from_hex(&hex).unwrap();
+        let signer = PeerSigner::for_service_key(key.clone(), "svc:passway".into());
+        let bearer = signer.bearer().unwrap();
+        let token = bearer.strip_prefix("Bearer ").unwrap();
+        let untrusted = UntrustedToken::<Local, V4>::try_from(token).unwrap();
+        let trusted = LocalToken::decrypt(&key, &untrusted, None, None).unwrap();
+        assert_eq!(
+            validate_claims(trusted.payload(), SERVICE_SCOPE, now_unix()).unwrap(),
+            "svc:passway"
+        );
+        assert!(validate_claims(trusted.payload(), PEER_SCOPE, now_unix()).is_err());
+        assert!(validate_claims(trusted.payload(), OPERATOR_SCOPE, now_unix()).is_err());
     }
 
     #[test]

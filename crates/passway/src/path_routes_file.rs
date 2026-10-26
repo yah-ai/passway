@@ -333,7 +333,7 @@ pub fn load(path: &Path) -> Result<Vec<MountSource>, PathRoutesError> {
         ))
     })?;
     let signer = crate::discovery::yubaba_peer_signer(
-        std::env::var(crate::discovery::CLUSTER_KEY_FILE_ENV).ok().as_deref(),
+        std::env::var(crate::discovery::SERVICE_KEY_FILE_ENV).ok().as_deref(),
     )
     .map_err(PathRoutesError)?;
     let cache_dir = std::env::var("PASSWAY_DISCOVERY_CACHE")

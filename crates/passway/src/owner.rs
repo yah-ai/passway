@@ -310,8 +310,8 @@ mod tests {
             url: "http://127.0.0.1:1/cluster/ingress-owner".into(),
             local: "127.0.0.1:8080".parse().unwrap(),
             peers: vec![
-                "45.32.194.254:443".parse().unwrap(),
-                "51.81.85.145:443".parse().unwrap(),
+                "203.0.113.12:443".parse().unwrap(),
+                "203.0.113.13:443".parse().unwrap(),
             ],
             remote_port: 443,
             sni: "cloud.mesh.yah.dev".into(),
@@ -325,7 +325,7 @@ mod tests {
         // Settled or not: a term storm on the owner must not bounce its door.
         for settled in [true, false] {
             assert_eq!(
-                plan_route(Some(&view(2, settled, true, Some((2, Some("15.204.89.240")))))),
+                plan_route(Some(&view(2, settled, true, Some((2, Some("203.0.113.11")))))),
                 Route::Local
             );
         }
@@ -335,11 +335,11 @@ mod tests {
     fn a_node_named_owner_but_not_serving_falls_back_to_peers() {
         // R936-B5: the returning node's replayed record names itself.
         assert_eq!(
-            plan_route(Some(&view(1, false, false, Some((1, Some("45.32.194.254")))))),
+            plan_route(Some(&view(1, false, false, Some((1, Some("203.0.113.12")))))),
             Route::Peers
         );
         assert_eq!(
-            plan_route(Some(&view(1, true, false, Some((1, Some("45.32.194.254")))))),
+            plan_route(Some(&view(1, true, false, Some((1, Some("203.0.113.12")))))),
             Route::Peers
         );
     }
@@ -347,15 +347,15 @@ mod tests {
     #[test]
     fn a_remote_owner_is_dialed_on_its_public_address_when_settled() {
         assert_eq!(
-            plan_route(Some(&view(3, true, false, Some((2, Some("15.204.89.240")))))),
-            Route::Owner("15.204.89.240".parse().unwrap())
+            plan_route(Some(&view(3, true, false, Some((2, Some("203.0.113.11")))))),
+            Route::Owner("203.0.113.11".parse().unwrap())
         );
     }
 
     #[test]
     fn an_unsettled_view_of_a_remote_owner_goes_to_peers() {
         assert_eq!(
-            plan_route(Some(&view(3, false, false, Some((2, Some("15.204.89.240")))))),
+            plan_route(Some(&view(3, false, false, Some((2, Some("203.0.113.11")))))),
             Route::Peers
         );
     }
@@ -394,8 +394,8 @@ mod tests {
         assert!(!local[0].opts.as_ref().unwrap().tls);
         assert!(!local[0].counts_door_hop, "loopback crosses no door");
 
-        let owner = upstreams_for(&Route::Owner("15.204.89.240".parse().unwrap()), &c);
-        assert_eq!(owner[0].addr, "15.204.89.240:443".parse().unwrap());
+        let owner = upstreams_for(&Route::Owner("203.0.113.11".parse().unwrap()), &c);
+        assert_eq!(owner[0].addr, "203.0.113.11:443".parse().unwrap());
         let o = owner[0].opts.as_ref().unwrap();
         assert!(o.tls);
         assert_eq!(o.sni, "cloud.mesh.yah.dev");
@@ -410,10 +410,10 @@ mod tests {
     fn the_wire_shape_parses() {
         let v: OwnerView = serde_json::from_str(
             r#"{"node_id":3,"settled":true,"serving_here":false,
-                "owner":{"node_id":2,"machine":"vps-4c1efa56","addr":"100.64.0.1:7443","public_address":"15.204.89.240"}}"#,
+                "owner":{"node_id":2,"machine":"vps-4c1efa56","addr":"100.64.0.1:7443","public_address":"203.0.113.11"}}"#,
         )
         .unwrap();
-        assert_eq!(v, view(3, true, false, Some((2, Some("15.204.89.240")))));
+        assert_eq!(v, view(3, true, false, Some((2, Some("203.0.113.11")))));
         let none: OwnerView =
             serde_json::from_str(r#"{"node_id":3,"settled":false,"owner":null}"#).unwrap();
         assert_eq!(none, view(3, false, false, None));
@@ -429,7 +429,7 @@ mod tests {
     #[test]
     fn a_failed_poll_keeps_the_last_view_from_this_process() {
         let src = OwnerUpstreams::new(cfg());
-        let good = view(2, true, true, Some((2, Some("15.204.89.240"))));
+        let good = view(2, true, true, Some((2, Some("203.0.113.11"))));
         assert_eq!(src.settle_view(Ok(good.clone())), Some(good.clone()));
         assert_eq!(src.settle_view(Err("down".into())), Some(good));
     }

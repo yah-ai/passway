@@ -979,7 +979,7 @@ fn parse_owner_route_env(
             sni,
             timeout: Duration::from_millis(timeout_ms),
             signer: passway::discovery::yubaba_peer_signer(
-                get(passway::discovery::CLUSTER_KEY_FILE_ENV).as_deref(),
+                get(passway::discovery::SERVICE_KEY_FILE_ENV).as_deref(),
             )?,
         },
     ))
@@ -1107,7 +1107,7 @@ fn build_upstream_sources(tls: &HostScoped<bool>, sni: &HostScoped<String>) -> V
         }
         "yubaba" => {
             let signer = passway::discovery::yubaba_peer_signer(
-                std::env::var(passway::discovery::CLUSTER_KEY_FILE_ENV).ok().as_deref(),
+                std::env::var(passway::discovery::SERVICE_KEY_FILE_ENV).ok().as_deref(),
             )
             .unwrap_or_else(|e| panic!("{e}"));
             let raw_url = std::env::var("PASSWAY_YUBABA_URL")
@@ -1670,7 +1670,7 @@ mod owner_env_tests {
         let (key, cfg) = parse_owner_route_env(env(&[
             ("PASSWAY_OWNER_URL", "http://100.64.0.1:7443/cluster/ingress-owner"),
             ("PASSWAY_OWNER_LOCAL", "127.0.0.1:8080"),
-            ("PASSWAY_OWNER_PEERS", "45.32.194.254:443, 51.81.85.145:443"),
+            ("PASSWAY_OWNER_PEERS", "203.0.113.12:443, 203.0.113.13:443"),
             ("PASSWAY_OWNER_SNI", "Cloud.Mesh.Yah.Dev"),
         ]))
         .unwrap();
